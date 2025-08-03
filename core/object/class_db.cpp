@@ -860,6 +860,21 @@ void ClassDB::_add_class(const StringName &p_class, const StringName &p_inherits
 	} else {
 		ti.inherits_ptr = nullptr;
 	}
+	if (name == "GDScript") {
+		classes["@GDScript"] = ClassInfo();
+		ClassInfo &ti2 = classes["@GDScript"];
+		ti2.name = "@GDScript";
+		ti2.inherits = p_inherits;
+		ti2.api = current_api;
+
+		if (ti2.inherits) {
+			ERR_FAIL_COND(!classes.has(ti2.inherits)); //it MUST be registered.
+			ti2.inherits_ptr = &classes[ti2.inherits];
+
+		} else {
+			ti2.inherits_ptr = nullptr;
+		}
+	}
 }
 
 static MethodInfo info_from_bind(MethodBind *p_method) {

@@ -158,12 +158,16 @@ Error SceneDebugger::_msg_save_node(const Array &p_args) {
 }
 
 Error SceneDebugger::_msg_inspect_objects(const Array &p_args) {
-	ERR_FAIL_COND_V(p_args.size() < 2, ERR_INVALID_DATA);
+	ERR_FAIL_COND_V(p_args.size() < 1, ERR_INVALID_DATA);
 	Vector<ObjectID> ids;
 	for (const Variant &id : (Array)p_args[0]) {
 		ids.append(ObjectID(id.operator uint64_t()));
 	}
-	_send_object_ids(ids, p_args[1]);
+	if (p_args.size() > 1){
+		_send_object_ids(ids, p_args[1]);
+	} else {
+		_send_object_ids(ids, true);
+	}
 	return OK;
 }
 
