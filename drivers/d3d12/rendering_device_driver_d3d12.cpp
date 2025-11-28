@@ -40,12 +40,34 @@
 #include "d3d12_godot_nir_bridge.h"
 #include "rendering_context_driver_d3d12.h"
 
+GODOT_GCC_WARNING_PUSH
+GODOT_GCC_WARNING_IGNORE("-Wimplicit-fallthrough")
+GODOT_GCC_WARNING_IGNORE("-Wlogical-not-parentheses")
+GODOT_GCC_WARNING_IGNORE("-Wmissing-field-initializers")
+GODOT_GCC_WARNING_IGNORE("-Wnon-virtual-dtor")
+GODOT_GCC_WARNING_IGNORE("-Wshadow")
+GODOT_GCC_WARNING_IGNORE("-Wswitch")
+GODOT_CLANG_WARNING_PUSH
+GODOT_CLANG_WARNING_IGNORE("-Wimplicit-fallthrough")
+GODOT_CLANG_WARNING_IGNORE("-Wlogical-not-parentheses")
+GODOT_CLANG_WARNING_IGNORE("-Wmissing-field-initializers")
+GODOT_CLANG_WARNING_IGNORE("-Wnon-virtual-dtor")
+GODOT_CLANG_WARNING_IGNORE("-Wstring-plus-int")
+GODOT_CLANG_WARNING_IGNORE("-Wswitch")
+GODOT_MSVC_WARNING_PUSH
+GODOT_MSVC_WARNING_IGNORE(4200) // "nonstandard extension used: zero-sized array in struct/union".
+GODOT_MSVC_WARNING_IGNORE(4806) // "'&': unsafe operation: no value of type 'bool' promoted to type 'uint32_t' can equal the given constant".
+
 #include <nir_spirv.h>
 #include <nir_to_dxil.h>
 #include <spirv_to_dxil.h>
 extern "C" {
 #include <dxil_spirv_nir.h>
 }
+
+GODOT_GCC_WARNING_POP
+GODOT_CLANG_WARNING_POP
+GODOT_MSVC_WARNING_POP
 
 #if !defined(_MSC_VER)
 #include <guiddef.h>
@@ -69,7 +91,15 @@ extern "C" {
 #endif
 #endif
 
+// Runs constant sanity checks on the structure of the descriptor heap pools to catch implementation errors.
+#define D3D12_DESCRIPTOR_HEAP_VERIFICATION 0
+
+// Tracks additional information and prints information about the allocation of descriptor heaps.
+#define D3D12_DESCRIPTOR_HEAP_VERBOSE 0
+
 static const D3D12_RANGE VOID_RANGE = {};
+
+static const uint32_t MAX_DYNAMIC_BUFFERS = 8u; // Minimum guaranteed by Vulkan.
 
 /*****************/
 /**** GENERIC ****/
@@ -315,52 +345,253 @@ const RenderingDeviceDriverD3D12::D3D12Format RenderingDeviceDriverD3D12::RD_TO_
 	/* DATA_FORMAT_ASTC_12x12_SFLOAT_BLOCK */ {},
 };
 
-Error RenderingDeviceDriverD3D12::DescriptorsHeap::allocate(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_descriptor_count, bool p_for_gpu) {
-	ERR_FAIL_COND_V(heap, ERR_ALREADY_EXISTS);
+Error RenderingDeviceDriverD3D12::CPUDescriptorsHeapPools::allocate(ID3D12Device *p_device, const D3D12_DESCRIPTOR_HEAP_DESC &p_desc, CPUDescriptorsHeapHandle &r_result) {
+	ERR_FAIL_COND_V(p_desc.NodeMask != 0 || p_desc.Flags != 0 || p_desc.Type >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES, ERR_INVALID_PARAMETER);
+
+	CPUDescriptorsHeapPool &pool = pools[p_desc.Type];
+	return pool.allocate(p_device, p_desc, r_result);
+}
+
+void RenderingDeviceDriverD3D12::CPUDescriptorsHeapPool::verify() {
+#if D3D12_DESCRIPTOR_HEAP_VERIFICATION
+	uint32_t last_size = std::numeric_limits<uint32_t>::max();
+	int block_count = 0;
+	for (SizeTableType::ValueType &index : free_blocks_by_size) {
+		DEV_ASSERT(!index.value.is_empty());
+		DEV_ASSERT(index.key <= last_size);
+
+		last_size = index.key;
+		for (uint32_t block_index : index.value) {
+			block_count++;
+			OffsetTableType::Iterator block = free_blocks_by_offset.find(block_index);
+			DEV_ASSERT(block != free_blocks_by_offset.end());
+			DEV_ASSERT(block->value.size == index.key && block->value.global_offset == block_index);
+		}
+	}
+
+	DEV_ASSERT(block_count == free_blocks_by_offset.size());
+#endif
+}
+
+Error RenderingDeviceDriverD3D12::CPUDescriptorsHeapPool::allocate(ID3D12Device *p_device, const D3D12_DESCRIPTOR_HEAP_DESC &p_desc, CPUDescriptorsHeapHandle &r_result) {
+	MutexLock lock(mutex);
+	verify();
+
+	SizeTableType::Iterator smallest_free_block = free_blocks_by_size.find_closest(p_desc.NumDescriptors);
+	OffsetTableType::Iterator block = free_blocks_by_offset.end();
+
+	if (smallest_free_block == free_blocks_by_size.end()) {
+		D3D12_DESCRIPTOR_HEAP_DESC descr_copy = p_desc;
+
+		// Allow for more than 1024 descriptor.
+		descr_copy.NumDescriptors = MAX(p_desc.NumDescriptors, 1024u);
+
+		ComPtr<ID3D12DescriptorHeap> heap;
+		HRESULT res = p_device->CreateDescriptorHeap(&descr_copy, IID_PPV_ARGS(heap.GetAddressOf()));
+		if (!SUCCEEDED(res)) {
+			ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDescriptorHeap failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+		}
+
+		FreeBlockInfo new_block = { heap, current_offset, current_offset, descr_copy.NumDescriptors, current_nonce++ };
+		block = free_blocks_by_offset.insert(new_block.global_offset, new_block);
+
+		// Duplicate the size to prevent this block from being joined with the next one.
+		current_offset += descr_copy.NumDescriptors << 1;
+	} else {
+		uint32_t offset = smallest_free_block->value.front()->get();
+		block = free_blocks_by_offset.find(offset);
+		ERR_FAIL_COND_V_MSG(block == free_blocks_by_offset.end(), ERR_CANT_CREATE, "CreateDescriptorHeap failed to find free block.");
+
+		remove_from_size_map(block->value);
+	}
+
+	r_result = { block->value.heap, this, block->value.global_offset - block->value.base_offset, block->value.base_offset, p_desc.NumDescriptors, current_nonce++ };
+
+	ERR_FAIL_COND_V_MSG(block->value.size < p_desc.NumDescriptors, ERR_CANT_CREATE, "CreateDescriptorHeap failed to find a block with enough descriptors.");
+
+	if (block->value.size > p_desc.NumDescriptors) {
+		// Block is too big, split into two chunks. Use the end of the block.
+		r_result.offset += block->value.size - p_desc.NumDescriptors;
+
+		// Cut the end of the block.
+		block->value.size -= p_desc.NumDescriptors;
+		add_to_size_map(block->value);
+	} else {
+		// Block fits, remove from block list.
+		free_blocks_by_offset.erase(block->value.global_offset);
+	}
+
+	DEV_ASSERT(!free_blocks_by_offset.has(r_result.global_offset()));
+	verify();
+
+#if D3D12_DESCRIPTOR_HEAP_VERBOSE
+	print_line(vformat("PoolAlloc: 0x%08ux.0x%08ux.0x%08ux.0x%08ux.0x%08ux", (uint64_t)(r_result.pool), (uint64_t)(r_result.heap), r_result.global_offset(), r_result.count, r_result.nonce));
+#endif
+
+	return OK;
+}
+
+void RenderingDeviceDriverD3D12::CPUDescriptorsHeapPool::remove_from_size_map(const FreeBlockInfo &p_block) {
+	SizeTableType::Iterator smallest_free_block = free_blocks_by_size.find(p_block.size);
+	if (smallest_free_block == free_blocks_by_size.end()) {
+		return;
+	}
+
+	// Remove from free list if no block of this size is left.
+	smallest_free_block->value.erase(p_block.global_offset);
+	if (smallest_free_block->value.is_empty()) {
+		free_blocks_by_size.erase(p_block.size);
+	}
+}
+
+void RenderingDeviceDriverD3D12::CPUDescriptorsHeapPool::add_to_size_map(const FreeBlockInfo &p_block) {
+	SizeTableType::Iterator free_block = free_blocks_by_size.find(p_block.size);
+	if (free_block == free_blocks_by_size.end()) {
+		free_blocks_by_size.insert(p_block.size, { p_block.global_offset });
+	} else {
+		free_block->value.push_back(p_block.global_offset);
+	}
+}
+
+Error RenderingDeviceDriverD3D12::CPUDescriptorsHeapPool::release(const CPUDescriptorsHeapHandle &p_result) {
+	MutexLock lock(mutex);
+
+#if D3D12_DESCRIPTOR_HEAP_VERBOSE
+	print_line(vformat("PoolFree: 0x%08ux.0x%08ux.0x%08ux.0x%08ux.0x%08ux", (uint64_t)(result.pool), (uint64_t)(result.heap), result.global_offset(), result.count, result.nonce));
+#endif
+
+	verify();
+
+	uint32_t global_offset = p_result.global_offset();
+	OffsetTableType::Iterator previous = free_blocks_by_offset.find_closest(global_offset);
+	OffsetTableType::Iterator next = free_blocks_by_offset.find(global_offset + p_result.count);
+
+	if (previous != free_blocks_by_offset.end() && (previous->value.size + previous->key) != global_offset) {
+		// Make sure the previous block is contiguous to this one.
+		previous = free_blocks_by_offset.end();
+	}
+
+	// Fail if the offset has already been released.
+	ERR_FAIL_COND_V(free_blocks_by_offset.has(global_offset), ERR_INVALID_PARAMETER);
+
+	OffsetTableType::Iterator new_block = free_blocks_by_offset.end();
+	if (previous != free_blocks_by_offset.end() && next != free_blocks_by_offset.end()) {
+		// The released block connects two existing blocks.
+		remove_from_size_map(previous->value);
+		remove_from_size_map(next->value);
+
+		previous->value.size += next->value.size + p_result.count;
+		free_blocks_by_offset.erase(next->value.global_offset);
+		new_block = previous;
+	} else if (previous != free_blocks_by_offset.end()) {
+		// Connects to the previous block.
+		remove_from_size_map(previous->value);
+		previous->value.size += p_result.count;
+		new_block = previous;
+	} else if (next != free_blocks_by_offset.end()) {
+		// Connects to the next block.
+		remove_from_size_map(next->value);
+
+		FreeBlockInfo merged_block = next->value;
+		merged_block.global_offset -= p_result.count;
+		merged_block.size += p_result.count;
+
+		// Replace with the merged block.
+		free_blocks_by_offset.erase(next->value.global_offset);
+		DEV_ASSERT(!free_blocks_by_offset.has(merged_block.global_offset));
+		new_block = free_blocks_by_offset.insert(merged_block.global_offset, merged_block);
+	} else {
+		// Connects to no block.
+		new_block = free_blocks_by_offset.insert(global_offset, FreeBlockInfo{ p_result.heap, global_offset, p_result.base_offset, p_result.count });
+	}
+
+	new_block->value.nonce = p_result.nonce;
+
+	add_to_size_map(new_block->value);
+	verify();
+
+	return OK;
+}
+
+RenderingDeviceDriverD3D12::CPUDescriptorsHeap::~CPUDescriptorsHeap() {
+	if (handle.pool) {
+		handle.pool->release(handle);
+	}
+}
+
+RenderingDeviceDriverD3D12::CPUDescriptorsHeapWalker RenderingDeviceDriverD3D12::CPUDescriptorsHeap::make_walker() const {
+	RenderingDeviceDriverD3D12::CPUDescriptorsHeapWalker walker;
+	walker.handle_size = handle_size;
+	walker.handle_count = desc.NumDescriptors;
+	if (handle.heap) {
+#if defined(_MSC_VER) || !defined(_WIN32)
+		walker.first_cpu_handle = handle.heap->GetCPUDescriptorHandleForHeapStart();
+#else
+		handle.heap->GetCPUDescriptorHandleForHeapStart(&walker.first_cpu_handle);
+#endif
+	}
+
+	walker.first_cpu_handle.ptr += handle.offset * handle_size;
+	return walker;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE RenderingDeviceDriverD3D12::CPUDescriptorsHeapWalker::get_curr_cpu_handle() {
+	ERR_FAIL_COND_V_MSG(is_at_eof(), D3D12_CPU_DESCRIPTOR_HANDLE(), "Heap walker is at EOF.");
+	return D3D12_CPU_DESCRIPTOR_HANDLE{ first_cpu_handle.ptr + handle_index * handle_size };
+}
+
+void RenderingDeviceDriverD3D12::CPUDescriptorsHeapWalker::advance(uint32_t p_count) {
+	ERR_FAIL_COND_MSG(handle_index + p_count > handle_count, "Would advance past EOF.");
+	handle_index += p_count;
+}
+
+Error RenderingDeviceDriverD3D12::CPUDescriptorsHeap::allocate(RenderingDeviceDriverD3D12 *p_driver, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_descriptor_count) {
+	ERR_FAIL_COND_V(handle.heap, ERR_ALREADY_EXISTS);
 	ERR_FAIL_COND_V(p_descriptor_count == 0, ERR_INVALID_PARAMETER);
 
+	ID3D12Device *p_device = p_driver->device.Get();
 	handle_size = p_device->GetDescriptorHandleIncrementSize(p_type);
 
 	desc.Type = p_type;
 	desc.NumDescriptors = p_descriptor_count;
-	desc.Flags = p_for_gpu ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+	return p_driver->cpu_descriptor_pool.allocate(p_device, desc, handle);
+}
+
+Error RenderingDeviceDriverD3D12::GPUDescriptorsHeap::allocate(RenderingDeviceDriverD3D12 *p_driver, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_descriptor_count) {
+	ERR_FAIL_COND_V(heap, ERR_ALREADY_EXISTS);
+	ERR_FAIL_COND_V(p_descriptor_count == 0, ERR_INVALID_PARAMETER);
+
+	ID3D12Device *p_device = p_driver->device.Get();
+	handle_size = p_device->GetDescriptorHandleIncrementSize(p_type);
+
+	desc.Type = p_type;
+	desc.NumDescriptors = p_descriptor_count;
+	desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	HRESULT res = p_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.GetAddressOf()));
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "CreateDescriptorHeap failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
 	return OK;
 }
 
-RenderingDeviceDriverD3D12::DescriptorsHeap::Walker RenderingDeviceDriverD3D12::DescriptorsHeap::make_walker() const {
-	Walker walker;
+RenderingDeviceDriverD3D12::GPUDescriptorsHeapWalker RenderingDeviceDriverD3D12::GPUDescriptorsHeap::make_walker() const {
+	GPUDescriptorsHeapWalker walker;
 	walker.handle_size = handle_size;
 	walker.handle_count = desc.NumDescriptors;
 	if (heap) {
 #if defined(_MSC_VER) || !defined(_WIN32)
 		walker.first_cpu_handle = heap->GetCPUDescriptorHandleForHeapStart();
-		if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
-			walker.first_gpu_handle = heap->GetGPUDescriptorHandleForHeapStart();
-		}
+		walker.first_gpu_handle = heap->GetGPUDescriptorHandleForHeapStart();
 #else
 		heap->GetCPUDescriptorHandleForHeapStart(&walker.first_cpu_handle);
-		if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
-			heap->GetGPUDescriptorHandleForHeapStart(&walker.first_gpu_handle);
-		}
+		heap->GetGPUDescriptorHandleForHeapStart(&walker.first_gpu_handle);
 #endif
 	}
 	return walker;
 }
 
-void RenderingDeviceDriverD3D12::DescriptorsHeap::Walker::advance(uint32_t p_count) {
-	ERR_FAIL_COND_MSG(handle_index + p_count > handle_count, "Would advance past EOF.");
-	handle_index += p_count;
-}
-
-D3D12_CPU_DESCRIPTOR_HANDLE RenderingDeviceDriverD3D12::DescriptorsHeap::Walker::get_curr_cpu_handle() {
-	ERR_FAIL_COND_V_MSG(is_at_eof(), D3D12_CPU_DESCRIPTOR_HANDLE(), "Heap walker is at EOF.");
-	return D3D12_CPU_DESCRIPTOR_HANDLE{ first_cpu_handle.ptr + handle_index * handle_size };
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE RenderingDeviceDriverD3D12::DescriptorsHeap::Walker::get_curr_gpu_handle() {
+D3D12_GPU_DESCRIPTOR_HANDLE RenderingDeviceDriverD3D12::GPUDescriptorsHeapWalker::get_curr_gpu_handle() {
 	ERR_FAIL_COND_V_MSG(!first_gpu_handle.ptr, D3D12_GPU_DESCRIPTOR_HANDLE(), "Can't provide a GPU handle from a non-GPU descriptors heap.");
 	ERR_FAIL_COND_V_MSG(is_at_eof(), D3D12_GPU_DESCRIPTOR_HANDLE(), "Heap walker is at EOF.");
 	return D3D12_GPU_DESCRIPTOR_HANDLE{ first_gpu_handle.ptr + handle_index * handle_size };
@@ -783,12 +1014,22 @@ void RenderingDeviceDriverD3D12::_resource_transitions_flush(CommandBufferInfo *
 /**** BUFFERS ****/
 /*****************/
 
-RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type) {
-	// D3D12 debug layers complain at CBV creation time if the size is not multiple of the value per the spec
-	// but also if you give a rounded size at that point because it will extend beyond the
-	// memory of the resource. Therefore, it seems the only way is to create it with a
-	// rounded size.
-	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(STEPIFY(p_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT));
+RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) {
+	uint32_t alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT; // 16 bytes is reasonable.
+	if (p_usage.has_flag(BUFFER_USAGE_UNIFORM_BIT)) {
+		// 256 bytes is absurd. Only use it when required.
+		alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+	}
+
+	// We don't have VMA like in Vulkan, that takes care of the details. We must align the size.
+	p_size = STEPIFY(p_size, alignment);
+
+	const size_t original_size = p_size;
+	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
+		p_size = p_size * frames.size();
+	}
+
+	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(p_size);
 	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT)) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	} else {
@@ -815,6 +1056,17 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 		} break;
 		case MEMORY_ALLOCATION_TYPE_GPU: {
 			// Use default parameters.
+			if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
+				allocation_desc.HeapType = dynamic_persistent_upload_heap;
+
+				// D3D12_HEAP_TYPE_UPLOAD mandates D3D12_RESOURCE_STATE_GENERIC_READ.
+				if (dynamic_persistent_upload_heap == D3D12_HEAP_TYPE_UPLOAD) {
+					initial_state = D3D12_RESOURCE_STATE_GENERIC_READ;
+				}
+
+				// We can't use STORAGE for write access, just for read.
+				resource_desc.Flags = resource_desc.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			}
 		} break;
 	}
 
@@ -845,14 +1097,30 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 
 	// Bookkeep.
 
-	BufferInfo *buf_info = VersatileResource::allocate<BufferInfo>(resources_allocator);
+	BufferInfo *buf_info;
+	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
+		void *persistent_ptr = nullptr;
+		res = buffer->Map(0, &VOID_RANGE, &persistent_ptr);
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), BufferID(), "Map failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+
+		BufferDynamicInfo *dyn_buffer = VersatileResource::allocate<BufferDynamicInfo>(resources_allocator);
+		buf_info = dyn_buffer;
+#ifdef DEBUG_ENABLED
+		dyn_buffer->last_frame_mapped = p_frames_drawn - 1ul;
+#endif
+		dyn_buffer->frame_idx = 0u;
+		dyn_buffer->persistent_ptr = (uint8_t *)persistent_ptr;
+	} else {
+		buf_info = VersatileResource::allocate<BufferInfo>(resources_allocator);
+	}
 	buf_info->resource = buffer.Get();
 	buf_info->owner_info.resource = buffer;
 	buf_info->owner_info.allocation = allocation;
 	buf_info->owner_info.states.subresource_states.push_back(initial_state);
 	buf_info->states_ptr = &buf_info->owner_info.states;
-	buf_info->size = p_size;
+	buf_info->size = original_size;
 	buf_info->flags.usable_as_uav = (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	buf_info->flags.is_dynamic = p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 	return BufferID(buf_info);
 }
@@ -865,7 +1133,12 @@ bool RenderingDeviceDriverD3D12::buffer_set_texel_format(BufferID p_buffer, Data
 
 void RenderingDeviceDriverD3D12::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
-	VersatileResource::free(resources_allocator, buf_info);
+	if (buf_info->is_dynamic()) {
+		buf_info->resource->Unmap(0, &VOID_RANGE);
+		VersatileResource::free(resources_allocator, (BufferDynamicInfo *)buf_info);
+	} else {
+		VersatileResource::free(resources_allocator, buf_info);
+	}
 }
 
 uint64_t RenderingDeviceDriverD3D12::buffer_get_allocation_size(BufferID p_buffer) {
@@ -884,6 +1157,35 @@ uint8_t *RenderingDeviceDriverD3D12::buffer_map(BufferID p_buffer) {
 void RenderingDeviceDriverD3D12::buffer_unmap(BufferID p_buffer) {
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	buf_info->resource->Unmap(0, &VOID_RANGE);
+}
+
+uint8_t *RenderingDeviceDriverD3D12::buffer_persistent_map_advance(BufferID p_buffer, uint64_t p_frames_drawn) {
+	BufferDynamicInfo *buf_info = (BufferDynamicInfo *)p_buffer.id;
+	ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), nullptr, "Buffer must have BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT. Use buffer_map() instead.");
+#ifdef DEBUG_ENABLED
+	ERR_FAIL_COND_V_MSG(buf_info->last_frame_mapped == p_frames_drawn, nullptr, "Buffers with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT must only be mapped once per frame. Otherwise there could be race conditions with the GPU. Amalgamate all data uploading into one map(), use an extra buffer or remove the bit.");
+	buf_info->last_frame_mapped = p_frames_drawn;
+#endif
+	buf_info->frame_idx = (buf_info->frame_idx + 1u) % frames.size();
+	return buf_info->persistent_ptr + buf_info->frame_idx * buf_info->size;
+}
+
+uint64_t RenderingDeviceDriverD3D12::buffer_get_dynamic_offsets(Span<BufferID> p_buffers) {
+	uint64_t mask = 0u;
+	uint64_t shift = 0u;
+
+	for (const BufferID &buf : p_buffers) {
+		const BufferInfo *buf_info = (const BufferInfo *)buf.id;
+		if (!buf_info->is_dynamic()) {
+			continue;
+		}
+		const BufferDynamicInfo *dyn_buf = (const BufferDynamicInfo *)buf.id;
+		mask |= dyn_buf->frame_idx << shift;
+		// We can encode the frame index in 2 bits since frame_count won't be > 4.
+		shift += 2UL;
+	}
+
+	return mask;
 }
 
 uint64_t RenderingDeviceDriverD3D12::buffer_get_device_address(BufferID p_buffer) {
@@ -1189,6 +1491,9 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 	if ((p_format.usage_bits & TEXTURE_USAGE_STORAGE_BIT)) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	}
+	if ((p_format.usage_bits & TEXTURE_USAGE_CPU_READ_BIT)) {
+		ERR_FAIL_V_MSG(TextureID(), "CPU readable textures are unsupported on D3D12.");
+	}
 	if ((p_format.usage_bits & TEXTURE_USAGE_VRS_ATTACHMENT_BIT) && (p_format.usage_bits & TEXTURE_USAGE_VRS_FRAGMENT_SHADING_RATE_BIT)) {
 		// For VRS images we can't use the typeless format.
 		resource_desc.Format = DXGI_FORMAT_R8_UINT;
@@ -1209,7 +1514,7 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 	// Create.
 
 	D3D12MA::ALLOCATION_DESC allocation_desc = {};
-	allocation_desc.HeapType = (p_format.usage_bits & TEXTURE_USAGE_CPU_READ_BIT) ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
+	allocation_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
 	if ((resource_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
 		allocation_desc.ExtraHeapFlags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
 	} else {
@@ -1343,12 +1648,6 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 	tex_info->mipmaps = resource_desc.MipLevels;
 	tex_info->view_descs.srv = srv_desc;
 	tex_info->view_descs.uav = uav_desc;
-
-	if (!barrier_capabilities.enhanced_barriers_supported && (p_format.usage_bits & (TEXTURE_USAGE_STORAGE_BIT | TEXTURE_USAGE_COLOR_ATTACHMENT_BIT))) {
-		// Fallback to clear resources when they're first used in a uniform set. Not necessary if enhanced barriers
-		// are supported, as the discard flag will be used instead when transitioning from an undefined layout.
-		textures_pending_clear.add(&tex_info->pending_clear);
-	}
 
 	return TextureID(tex_info);
 }
@@ -1616,7 +1915,8 @@ uint64_t RenderingDeviceDriverD3D12::texture_get_allocation_size(TextureID p_tex
 void RenderingDeviceDriverD3D12::texture_get_copyable_layout(TextureID p_texture, const TextureSubresource &p_subresource, TextureCopyableLayout *r_layout) {
 	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
 
-	UINT subresource = tex_info->desc.CalcSubresource(p_subresource.mipmap, p_subresource.layer, 0);
+	UINT plane = _compute_plane_slice(tex_info->format, p_subresource.aspect);
+	UINT subresource = tex_info->desc.CalcSubresource(p_subresource.mipmap, p_subresource.layer, plane);
 
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
 	UINT64 subresource_total_size = 0;
@@ -1631,39 +1931,20 @@ void RenderingDeviceDriverD3D12::texture_get_copyable_layout(TextureID p_texture
 			&subresource_total_size);
 
 	*r_layout = {};
-	r_layout->offset = footprint.Offset;
 	r_layout->size = subresource_total_size;
 	r_layout->row_pitch = footprint.Footprint.RowPitch;
-	r_layout->depth_pitch = subresource_total_size / tex_info->desc.Depth();
-	r_layout->layer_pitch = subresource_total_size / tex_info->desc.ArraySize();
 }
 
-uint8_t *RenderingDeviceDriverD3D12::texture_map(TextureID p_texture, const TextureSubresource &p_subresource) {
-	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
-#ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_V(tex_info->mapped_subresource != UINT_MAX, nullptr);
-#endif
-
-	UINT plane = _compute_plane_slice(tex_info->format, p_subresource.aspect);
-	UINT subresource = tex_info->desc.CalcSubresource(p_subresource.mipmap, p_subresource.layer, plane);
-
-	void *data_ptr = nullptr;
-	HRESULT res = tex_info->resource->Map(subresource, &VOID_RANGE, &data_ptr);
-	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), nullptr, "Map failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
-	tex_info->mapped_subresource = subresource;
-	return (uint8_t *)data_ptr;
-}
-
-void RenderingDeviceDriverD3D12::texture_unmap(TextureID p_texture) {
-	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
-#ifdef DEBUG_ENABLED
-	ERR_FAIL_COND(tex_info->mapped_subresource == UINT_MAX);
-#endif
-	tex_info->resource->Unmap(tex_info->mapped_subresource, &VOID_RANGE);
-	tex_info->mapped_subresource = UINT_MAX;
+Vector<uint8_t> RenderingDeviceDriverD3D12::texture_get_data(TextureID p_texture, uint32_t p_layer) {
+	ERR_FAIL_V_MSG(Vector<uint8_t>(), "Cannot get texture data. CPU readable textures are unsupported on D3D12.");
 }
 
 BitField<RDD::TextureUsageBits> RenderingDeviceDriverD3D12::texture_get_usages_supported_by_format(DataFormat p_format, bool p_cpu_readable) {
+	if (p_cpu_readable) {
+		// CPU readable textures are unsupported on D3D12.
+		return 0;
+	}
+
 	D3D12_FEATURE_DATA_FORMAT_SUPPORT srv_rtv_support = {};
 	srv_rtv_support.Format = RD_TO_D3D12_FORMAT[p_format].general_format;
 	if (srv_rtv_support.Format != DXGI_FORMAT_UNKNOWN) { // Some implementations (i.e., vkd3d-proton) error out instead of returning empty.
@@ -1832,27 +2113,36 @@ bool RenderingDeviceDriverD3D12::sampler_is_format_supported_for_filter(DataForm
 /**** VERTEX ARRAY ****/
 /**********************/
 
-RDD::VertexFormatID RenderingDeviceDriverD3D12::vertex_format_create(VectorView<VertexAttribute> p_vertex_attribs) {
+RDD::VertexFormatID RenderingDeviceDriverD3D12::vertex_format_create(Span<VertexAttribute> p_vertex_attribs, const VertexAttributeBindingsMap &p_vertex_bindings) {
 	VertexFormatInfo *vf_info = VersatileResource::allocate<VertexFormatInfo>(resources_allocator);
-
 	vf_info->input_elem_descs.resize(p_vertex_attribs.size());
-	vf_info->vertex_buffer_strides.resize(p_vertex_attribs.size());
+
+	uint32_t max_binding = 0;
 	for (uint32_t i = 0; i < p_vertex_attribs.size(); i++) {
-		vf_info->input_elem_descs[i] = {};
-		vf_info->input_elem_descs[i].SemanticName = "TEXCOORD";
-		vf_info->input_elem_descs[i].SemanticIndex = p_vertex_attribs[i].location;
-		vf_info->input_elem_descs[i].Format = RD_TO_D3D12_FORMAT[p_vertex_attribs[i].format].general_format;
-		vf_info->input_elem_descs[i].InputSlot = i; // TODO: Can the same slot be used if data comes from the same buffer (regardless format)?
-		vf_info->input_elem_descs[i].AlignedByteOffset = p_vertex_attribs[i].offset;
-		if (p_vertex_attribs[i].frequency == VERTEX_FREQUENCY_INSTANCE) {
-			vf_info->input_elem_descs[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-			vf_info->input_elem_descs[i].InstanceDataStepRate = 1;
+		D3D12_INPUT_ELEMENT_DESC &input_element_desc = vf_info->input_elem_descs[i];
+		const VertexAttribute &vertex_attrib = p_vertex_attribs[i];
+		const VertexAttributeBinding &vertex_binding = p_vertex_bindings[vertex_attrib.binding];
+
+		input_element_desc = {};
+		input_element_desc.SemanticName = "TEXCOORD";
+		input_element_desc.SemanticIndex = vertex_attrib.location;
+		input_element_desc.Format = RD_TO_D3D12_FORMAT[vertex_attrib.format].general_format;
+		input_element_desc.InputSlot = vertex_attrib.binding;
+		input_element_desc.AlignedByteOffset = vertex_attrib.offset;
+		if (vertex_binding.frequency == VERTEX_FREQUENCY_INSTANCE) {
+			input_element_desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+			input_element_desc.InstanceDataStepRate = 1;
 		} else {
-			vf_info->input_elem_descs[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-			vf_info->input_elem_descs[i].InstanceDataStepRate = 0;
+			input_element_desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+			input_element_desc.InstanceDataStepRate = 0;
 		}
 
-		vf_info->vertex_buffer_strides[i] = p_vertex_attribs[i].stride;
+		max_binding = MAX(max_binding, vertex_attrib.binding + 1);
+	}
+
+	vf_info->vertex_buffer_strides.resize(max_binding);
+	for (const VertexAttributeBindingsMap::KV &vertex_binding_pair : p_vertex_bindings) {
+		vf_info->vertex_buffer_strides[vertex_binding_pair.key] = vertex_binding_pair.value.stride;
 	}
 
 	return VertexFormatID(vf_info);
@@ -2119,7 +2409,7 @@ static D3D12_BARRIER_LAYOUT _rd_texture_layout_to_d3d12_barrier_layout(RDD::Text
 void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_buffer,
 		BitField<PipelineStageBits> p_src_stages,
 		BitField<PipelineStageBits> p_dst_stages,
-		VectorView<RDD::MemoryBarrier> p_memory_barriers,
+		VectorView<RDD::MemoryAccessBarrier> p_memory_barriers,
 		VectorView<RDD::BufferBarrier> p_buffer_barriers,
 		VectorView<RDD::TextureBarrier> p_texture_barriers) {
 	if (!barrier_capabilities.enhanced_barriers_supported) {
@@ -2134,8 +2424,8 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 
 	// The command list must support the required interface.
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)(p_cmd_buffer.id);
-	ID3D12GraphicsCommandList7 *cmd_list_7 = nullptr;
-	HRESULT res = cmd_buf_info->cmd_list->QueryInterface(IID_PPV_ARGS(&cmd_list_7));
+	ComPtr<ID3D12GraphicsCommandList7> cmd_list_7;
+	HRESULT res = cmd_buf_info->cmd_list->QueryInterface(cmd_list_7.GetAddressOf());
 	ERR_FAIL_COND(FAILED(res));
 
 	// Convert the RDD barriers to D3D12 enhanced barriers.
@@ -2148,7 +2438,7 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 
 	D3D12_GLOBAL_BARRIER global_barrier = {};
 	for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
-		const MemoryBarrier &memory_barrier = p_memory_barriers[i];
+		const MemoryAccessBarrier &memory_barrier = p_memory_barriers[i];
 		_rd_stages_and_access_to_d3d12(p_src_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.src_access, global_barrier.SyncBefore, global_barrier.AccessBefore);
 		_rd_stages_and_access_to_d3d12(p_dst_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.dst_access, global_barrier.SyncAfter, global_barrier.AccessAfter);
 		global_barriers.push_back(global_barrier);
@@ -2416,21 +2706,21 @@ RDD::CommandBufferID RenderingDeviceDriverD3D12::command_buffer_create(CommandPo
 		list_type = D3D12_COMMAND_LIST_TYPE(command_pool->queue_family.id - 1);
 	}
 
-	ID3D12CommandAllocator *cmd_allocator = nullptr;
+	ComPtr<ID3D12CommandAllocator> cmd_allocator;
 	{
-		HRESULT res = device->CreateCommandAllocator(list_type, IID_PPV_ARGS(&cmd_allocator));
+		HRESULT res = device->CreateCommandAllocator(list_type, IID_PPV_ARGS(cmd_allocator.GetAddressOf()));
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), CommandBufferID(), "CreateCommandAllocator failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	}
 
-	ID3D12GraphicsCommandList *cmd_list = nullptr;
+	ComPtr<ID3D12GraphicsCommandList> cmd_list;
 	{
 		ComPtr<ID3D12Device4> device_4;
 		device->QueryInterface(device_4.GetAddressOf());
 		HRESULT res = E_FAIL;
 		if (device_4) {
-			res = device_4->CreateCommandList1(0, list_type, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&cmd_list));
+			res = device_4->CreateCommandList1(0, list_type, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(cmd_list.GetAddressOf()));
 		} else {
-			res = device->CreateCommandList(0, list_type, cmd_allocator, nullptr, IID_PPV_ARGS(&cmd_list));
+			res = device->CreateCommandList(0, list_type, cmd_allocator.Get(), nullptr, IID_PPV_ARGS(cmd_list.GetAddressOf()));
 		}
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), CommandBufferID(), "CreateCommandList failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 		if (!device_4) {
@@ -2581,6 +2871,15 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 		_swap_chain_release(swap_chain);
 	}
 
+#ifdef DCOMP_ENABLED
+	bool create_for_composition = OS::get_singleton()->is_layered_allowed();
+#else
+	if (OS::get_singleton()->is_layered_allowed()) {
+		WARN_PRINT_ONCE("Window transparency is not supported without DirectComposition on D3D12.");
+	}
+	bool create_for_composition = false;
+#endif
+
 	DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {};
 	if (swap_chain->d3d_swap_chain != nullptr) {
 		_swap_chain_release_buffers(swap_chain);
@@ -2594,7 +2893,7 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 		swap_chain_desc.SampleDesc.Count = 1;
 		swap_chain_desc.Flags = creation_flags;
 		swap_chain_desc.Scaling = DXGI_SCALING_STRETCH;
-		if (OS::get_singleton()->is_layered_allowed()) {
+		if (create_for_composition) {
 			swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 			has_comp_alpha[(uint64_t)p_cmd_queue.id] = true;
 		} else {
@@ -2605,16 +2904,20 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 		swap_chain_desc.Height = surface->height;
 
 		ComPtr<IDXGISwapChain1> swap_chain_1;
-#ifdef DCOMP_ENABLED
-		res = context_driver->dxgi_factory_get()->CreateSwapChainForComposition(command_queue->d3d_queue.Get(), &swap_chain_desc, nullptr, swap_chain_1.GetAddressOf());
-#else
-		res = context_driver->dxgi_factory_get()->CreateSwapChainForHwnd(command_queue->d3d_queue.Get(), surface->hwnd, &swap_chain_desc, nullptr, nullptr, swap_chain_1.GetAddressOf());
-		if (!SUCCEEDED(res) && swap_chain_desc.AlphaMode != DXGI_ALPHA_MODE_IGNORE) {
-			swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-			has_comp_alpha[(uint64_t)p_cmd_queue.id] = false;
+		if (create_for_composition) {
+			res = context_driver->dxgi_factory_get()->CreateSwapChainForComposition(command_queue->d3d_queue.Get(), &swap_chain_desc, nullptr, swap_chain_1.GetAddressOf());
+			if (!SUCCEEDED(res)) {
+				WARN_PRINT_ONCE("Window transparency is not supported without DirectComposition on D3D12.");
+				swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+				has_comp_alpha[(uint64_t)p_cmd_queue.id] = false;
+				create_for_composition = false;
+
+				res = context_driver->dxgi_factory_get()->CreateSwapChainForHwnd(command_queue->d3d_queue.Get(), surface->hwnd, &swap_chain_desc, nullptr, nullptr, swap_chain_1.GetAddressOf());
+			}
+		} else {
 			res = context_driver->dxgi_factory_get()->CreateSwapChainForHwnd(command_queue->d3d_queue.Get(), surface->hwnd, &swap_chain_desc, nullptr, nullptr, swap_chain_1.GetAddressOf());
 		}
-#endif
+
 		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
 		swap_chain_1.As(&swap_chain->d3d_swap_chain);
@@ -2625,34 +2928,36 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 	}
 
 #ifdef DCOMP_ENABLED
-	if (surface->composition_device.Get() == nullptr) {
-		using PFN_DCompositionCreateDevice = HRESULT(WINAPI *)(IDXGIDevice *, REFIID, void **);
-		PFN_DCompositionCreateDevice pfn_DCompositionCreateDevice = (PFN_DCompositionCreateDevice)(void *)GetProcAddress(context_driver->lib_dcomp, "DCompositionCreateDevice");
-		ERR_FAIL_NULL_V(pfn_DCompositionCreateDevice, ERR_CANT_CREATE);
+	if (create_for_composition) {
+		if (surface->composition_device.Get() == nullptr) {
+			using PFN_DCompositionCreateDevice = HRESULT(WINAPI *)(IDXGIDevice *, REFIID, void **);
+			PFN_DCompositionCreateDevice pfn_DCompositionCreateDevice = (PFN_DCompositionCreateDevice)(void *)GetProcAddress(context_driver->lib_dcomp, "DCompositionCreateDevice");
+			ERR_FAIL_NULL_V(pfn_DCompositionCreateDevice, ERR_CANT_CREATE);
 
-		res = pfn_DCompositionCreateDevice(nullptr, IID_PPV_ARGS(surface->composition_device.GetAddressOf()));
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = pfn_DCompositionCreateDevice(nullptr, IID_PPV_ARGS(surface->composition_device.GetAddressOf()));
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_device->CreateTargetForHwnd(surface->hwnd, TRUE, surface->composition_target.GetAddressOf());
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_device->CreateTargetForHwnd(surface->hwnd, TRUE, surface->composition_target.GetAddressOf());
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_device->CreateVisual(surface->composition_visual.GetAddressOf());
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_device->CreateVisual(surface->composition_visual.GetAddressOf());
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_visual->SetContent(swap_chain->d3d_swap_chain.Get());
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_visual->SetContent(swap_chain->d3d_swap_chain.Get());
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_target->SetRoot(surface->composition_visual.Get());
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_target->SetRoot(surface->composition_visual.Get());
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_device->Commit();
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
-	} else {
-		res = surface->composition_visual->SetContent(swap_chain->d3d_swap_chain.Get());
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_device->Commit();
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+		} else {
+			res = surface->composition_visual->SetContent(swap_chain->d3d_swap_chain.Get());
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-		res = surface->composition_device->Commit();
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+			res = surface->composition_device->Commit();
+			ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+		}
 	}
 #endif
 
@@ -2826,7 +3131,7 @@ D3D12_UNORDERED_ACCESS_VIEW_DESC RenderingDeviceDriverD3D12::_make_ranged_uav_fo
 		} break;
 		case D3D12_UAV_DIMENSION_TEXTURE3D: {
 			uav_desc.Texture3D.MipSlice = mip;
-			uav_desc.Texture3D.WSize >>= p_mipmap_offset;
+			uav_desc.Texture3D.WSize = MAX(uav_desc.Texture3D.WSize >> p_mipmap_offset, 1U);
 		} break;
 		default:
 			break;
@@ -2904,22 +3209,22 @@ RDD::FramebufferID RenderingDeviceDriverD3D12::_framebuffer_create(RenderPassID 
 	}
 
 	if (num_color) {
-		Error err = fb_info->rtv_heap.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, num_color, false);
+		Error err = fb_info->rtv_heap.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, num_color);
 		if (err) {
 			VersatileResource::free(resources_allocator, fb_info);
 			ERR_FAIL_V(FramebufferID());
 		}
 	}
-	DescriptorsHeap::Walker rtv_heap_walker = fb_info->rtv_heap.make_walker();
+	CPUDescriptorsHeapWalker rtv_heap_walker = fb_info->rtv_heap.make_walker();
 
 	if (num_depth_stencil) {
-		Error err = fb_info->dsv_heap.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, num_depth_stencil, false);
+		Error err = fb_info->dsv_heap.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, num_depth_stencil);
 		if (err) {
 			VersatileResource::free(resources_allocator, fb_info);
 			ERR_FAIL_V(FramebufferID());
 		}
 	}
-	DescriptorsHeap::Walker dsv_heap_walker = fb_info->dsv_heap.make_walker();
+	CPUDescriptorsHeapWalker dsv_heap_walker = fb_info->dsv_heap.make_walker();
 
 	fb_info->attachments_handle_inds.resize(p_attachments.size());
 	fb_info->attachments.reserve(num_color + num_depth_stencil);
@@ -3119,7 +3424,7 @@ void RenderingDeviceDriverD3D12::shader_destroy_modules(ShaderID p_shader) {
 /**** UNIFORM SET ****/
 /*********************/
 
-static void _add_descriptor_count_for_uniform(RenderingDevice::UniformType p_type, uint32_t p_binding_length, bool p_double_srv_uav_ambiguous, uint32_t &r_num_resources, uint32_t &r_num_samplers, bool &r_srv_uav_ambiguity) {
+static void _add_descriptor_count_for_uniform(RenderingDevice::UniformType p_type, uint32_t p_binding_length, bool p_double_srv_uav_ambiguous, uint32_t &r_num_resources, uint32_t &r_num_samplers, bool &r_srv_uav_ambiguity, uint32_t p_frame_count) {
 	r_srv_uav_ambiguity = false;
 
 	// Some resource types can be SRV or UAV, depending on what NIR-DXIL decided for a specific shader variant.
@@ -3139,9 +3444,17 @@ static void _add_descriptor_count_for_uniform(RenderingDevice::UniformType p_typ
 		case RenderingDevice::UNIFORM_TYPE_UNIFORM_BUFFER: {
 			r_num_resources += 1;
 		} break;
+		case RenderingDevice::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+			r_num_resources += p_frame_count;
+		} break;
 		case RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER: {
 			r_num_resources += p_double_srv_uav_ambiguous ? 2 : 1;
 			r_srv_uav_ambiguity = true;
+		} break;
+		case RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
+			// Dynamic storage buffers can only be SRV (we can't guarantee they get placed in
+			// D3D12_HEAP_TYPE_GPU_UPLOAD heap and D3D12_HEAP_TYPE_GPU doesn't support UAV).
+			r_num_resources += p_frame_count;
 		} break;
 		case RenderingDevice::UNIFORM_TYPE_IMAGE: {
 			r_num_resources += p_binding_length * (p_double_srv_uav_ambiguous ? 2 : 1);
@@ -3159,6 +3472,11 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 	// Pre-bookkeep.
 	UniformSetInfo *uniform_set_info = VersatileResource::allocate<UniformSetInfo>(resources_allocator);
 
+	// We first gather dynamic arrays in a local array because TightLocalVector's
+	// growth is not efficient when the number of elements is unknown.
+	const BufferDynamicInfo *dynamic_buffers[MAX_DYNAMIC_BUFFERS];
+	uint32_t num_dynamic_buffers = 0u;
+
 	// Do a first pass to count resources and samplers.
 	uint32_t num_resource_descs = 0;
 	uint32_t num_sampler_descs = 0;
@@ -3175,29 +3493,29 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		if (uniform.type == UNIFORM_TYPE_SAMPLER_WITH_TEXTURE || uniform.type == UNIFORM_TYPE_SAMPLER_WITH_TEXTURE_BUFFER) {
 			binding_length /= 2;
 		}
-		_add_descriptor_count_for_uniform(uniform.type, binding_length, true, num_resource_descs, num_sampler_descs, srv_uav_ambiguity);
+		_add_descriptor_count_for_uniform(uniform.type, binding_length, true, num_resource_descs, num_sampler_descs, srv_uav_ambiguity, frames.size());
 	}
 #ifdef DEV_ENABLED
 	uniform_set_info->resources_desc_info.reserve(num_resource_descs);
 #endif
 
 	if (num_resource_descs) {
-		Error err = uniform_set_info->desc_heaps.resources.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, num_resource_descs, false);
+		Error err = uniform_set_info->desc_heaps.resources.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, num_resource_descs);
 		if (err) {
 			VersatileResource::free(resources_allocator, uniform_set_info);
 			ERR_FAIL_V(UniformSetID());
 		}
 	}
 	if (num_sampler_descs) {
-		Error err = uniform_set_info->desc_heaps.samplers.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, num_sampler_descs, false);
+		Error err = uniform_set_info->desc_heaps.samplers.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, num_sampler_descs);
 		if (err) {
 			VersatileResource::free(resources_allocator, uniform_set_info);
 			ERR_FAIL_V(UniformSetID());
 		}
 	}
 	struct {
-		DescriptorsHeap::Walker resources;
-		DescriptorsHeap::Walker samplers;
+		CPUDescriptorsHeapWalker resources;
+		CPUDescriptorsHeapWalker samplers;
 	} desc_heap_walkers;
 	desc_heap_walkers.resources = uniform_set_info->desc_heaps.resources.make_walker();
 	desc_heap_walkers.samplers = uniform_set_info->desc_heaps.samplers.make_walker();
@@ -3298,64 +3616,94 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 			case UNIFORM_TYPE_IMAGE_BUFFER: {
 				CRASH_NOW_MSG("Unimplemented!");
 			} break;
-			case UNIFORM_TYPE_UNIFORM_BUFFER: {
+			case UNIFORM_TYPE_UNIFORM_BUFFER:
+			case UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC: {
 				BufferInfo *buf_info = (BufferInfo *)uniform.ids[0].id;
+
+				if (uniform.type == UNIFORM_TYPE_UNIFORM_BUFFER) {
+					ERR_FAIL_COND_V_MSG(buf_info->is_dynamic(), UniformSetID(),
+							"Sent a buffer with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_UNIFORM_BUFFER instead of UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC.");
+				} else {
+					ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), UniformSetID(),
+							"Sent a buffer without BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC instead of UNIFORM_TYPE_UNIFORM_BUFFER.");
+					ERR_FAIL_COND_V_MSG(num_dynamic_buffers >= MAX_DYNAMIC_BUFFERS, UniformSetID(),
+							"Uniform set exceeded the limit of dynamic/persistent buffers. (" + itos(MAX_DYNAMIC_BUFFERS) + ").");
+
+					dynamic_buffers[num_dynamic_buffers++] = (const BufferDynamicInfo *)buf_info;
+				}
 
 				D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {};
 				cbv_desc.BufferLocation = buf_info->resource->GetGPUVirtualAddress();
-				cbv_desc.SizeInBytes = STEPIFY(buf_info->size, 256);
-				device->CreateConstantBufferView(&cbv_desc, desc_heap_walkers.resources.get_curr_cpu_handle());
-				desc_heap_walkers.resources.advance();
+				cbv_desc.SizeInBytes = STEPIFY(buf_info->size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+
+				const uint32_t subregion_count = uniform.type == UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC ? frames.size() : 1u;
+				for (uint32_t j = 0u; j < subregion_count; ++j) {
+					device->CreateConstantBufferView(&cbv_desc, desc_heap_walkers.resources.get_curr_cpu_handle());
+					desc_heap_walkers.resources.advance();
 #ifdef DEV_ENABLED
-				uniform_set_info->resources_desc_info.push_back({ D3D12_DESCRIPTOR_RANGE_TYPE_CBV, {} });
+					uniform_set_info->resources_desc_info.push_back({ D3D12_DESCRIPTOR_RANGE_TYPE_CBV, {} });
 #endif
+					cbv_desc.BufferLocation += cbv_desc.SizeInBytes;
+				}
 
 				NeededState &ns = resource_states[buf_info];
 				ns.is_buffer = true;
 				ns.shader_uniform_idx_mask |= ((uint64_t)1 << i);
 				ns.states |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 			} break;
-			case UNIFORM_TYPE_STORAGE_BUFFER: {
+			case UNIFORM_TYPE_STORAGE_BUFFER:
+			case UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
 				BufferInfo *buf_info = (BufferInfo *)uniform.ids[0].id;
 
-				// SRV first. [[SRV_UAV_AMBIGUITY]]
-				{
-					D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-					srv_desc.Format = DXGI_FORMAT_R32_TYPELESS;
-					srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-					srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-					srv_desc.Buffer.FirstElement = 0;
-					srv_desc.Buffer.NumElements = (buf_info->size + 3) / 4;
-					srv_desc.Buffer.StructureByteStride = 0;
-					srv_desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+				if (uniform.type == UNIFORM_TYPE_STORAGE_BUFFER) {
+					ERR_FAIL_COND_V_MSG(buf_info->is_dynamic(), UniformSetID(),
+							"Sent a buffer with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_STORAGE_BUFFER instead of UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC.");
+				} else {
+					ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), UniformSetID(),
+							"Sent a buffer without BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC instead of UNIFORM_TYPE_STORAGE_BUFFER.");
+					ERR_FAIL_COND_V_MSG(num_dynamic_buffers >= MAX_DYNAMIC_BUFFERS, UniformSetID(),
+							"Uniform set exceeded the limit of dynamic/persistent buffers. (" + itos(MAX_DYNAMIC_BUFFERS) + ").");
+
+					dynamic_buffers[num_dynamic_buffers++] = (const BufferDynamicInfo *)buf_info;
+				}
+
+				D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+				srv_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+				srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+				srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				srv_desc.Buffer.FirstElement = 0;
+				srv_desc.Buffer.NumElements = (buf_info->size + 3u) / 4u;
+				srv_desc.Buffer.StructureByteStride = 0;
+				srv_desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+				D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+				uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+				uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+				uav_desc.Buffer.FirstElement = 0;
+				uav_desc.Buffer.NumElements = (buf_info->size + 3u) / 4u;
+				uav_desc.Buffer.StructureByteStride = 0;
+				uav_desc.Buffer.CounterOffsetInBytes = 0;
+				uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+
+				const uint32_t subregion_count = uniform.type == UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC ? frames.size() : 1u;
+				for (uint32_t j = 0u; j < subregion_count; ++j) {
+					// SRV first. [[SRV_UAV_AMBIGUITY]]
 					device->CreateShaderResourceView(buf_info->resource, &srv_desc, desc_heap_walkers.resources.get_curr_cpu_handle());
 #ifdef DEV_ENABLED
 					uniform_set_info->resources_desc_info.push_back({ D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srv_desc.ViewDimension });
 #endif
 					desc_heap_walkers.resources.advance();
-				}
+					srv_desc.Buffer.FirstElement += srv_desc.Buffer.NumElements;
 
-				// UAV then. [[SRV_UAV_AMBIGUITY]]
-				{
+					// UAV then. [[SRV_UAV_AMBIGUITY]]
 					if (buf_info->flags.usable_as_uav) {
-						D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-						uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
-						uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-						uav_desc.Buffer.FirstElement = 0;
-						uav_desc.Buffer.NumElements = (buf_info->size + 3) / 4;
-						uav_desc.Buffer.StructureByteStride = 0;
-						uav_desc.Buffer.CounterOffsetInBytes = 0;
-						uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 						device->CreateUnorderedAccessView(buf_info->resource, nullptr, &uav_desc, desc_heap_walkers.resources.get_curr_cpu_handle());
 #ifdef DEV_ENABLED
 						uniform_set_info->resources_desc_info.push_back({ D3D12_DESCRIPTOR_RANGE_TYPE_UAV, {} });
 #endif
-					} else {
-						// If can't transition to UAV, leave this one empty since it won't be
-						// used, and trying to create an UAV view would trigger a validation error.
+						uav_desc.Buffer.FirstElement += uav_desc.Buffer.NumElements;
+						desc_heap_walkers.resources.advance();
 					}
-
-					desc_heap_walkers.resources.advance();
 				}
 
 				NeededState &ns = resource_states[buf_info];
@@ -3384,6 +3732,11 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		}
 	}
 
+	uniform_set_info->dynamic_buffers.resize(num_dynamic_buffers);
+	for (size_t i = 0u; i < num_dynamic_buffers; ++i) {
+		uniform_set_info->dynamic_buffers[i] = dynamic_buffers[i];
+	}
+
 	DEV_ASSERT(desc_heap_walkers.resources.is_at_eof());
 	DEV_ASSERT(desc_heap_walkers.samplers.is_at_eof());
 
@@ -3407,26 +3760,36 @@ void RenderingDeviceDriverD3D12::uniform_set_free(UniformSetID p_uniform_set) {
 	VersatileResource::free(resources_allocator, uniform_set_info);
 }
 
+uint32_t RenderingDeviceDriverD3D12::uniform_sets_get_dynamic_offsets(VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) const {
+	uint32_t mask = 0u;
+	uint32_t shift = 0u;
+#ifdef DEV_ENABLED
+	uint32_t curr_dynamic_offset = 0u;
+#endif
+
+	for (uint32_t i = 0; i < p_set_count; i++) {
+		const UniformSetInfo *usi = (const UniformSetInfo *)p_uniform_sets[i].id;
+		// At this point this assert should already have been validated.
+		DEV_ASSERT(curr_dynamic_offset + usi->dynamic_buffers.size() <= MAX_DYNAMIC_BUFFERS);
+
+		for (const BufferDynamicInfo *dynamic_buffer : usi->dynamic_buffers) {
+			DEV_ASSERT(dynamic_buffer->frame_idx < 16u);
+			mask |= dynamic_buffer->frame_idx << shift;
+			shift += 4u;
+		}
+#ifdef DEV_ENABLED
+		curr_dynamic_offset += usi->dynamic_buffers.size();
+#endif
+	}
+
+	return mask;
+}
+
 // ----- COMMANDS -----
 
 void RenderingDeviceDriverD3D12::command_uniform_set_prepare_for_use(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
 	if (barrier_capabilities.enhanced_barriers_supported) {
 		return;
-	}
-
-	// Perform pending blackouts.
-	{
-		SelfList<TextureInfo> *E = textures_pending_clear.first();
-		while (E) {
-			TextureSubresourceRange subresources;
-			subresources.layer_count = E->self()->layers;
-			subresources.mipmap_count = E->self()->mipmaps;
-			command_clear_color_texture(p_cmd_buffer, TextureID(E->self()), TEXTURE_LAYOUT_UNDEFINED, Color(), subresources);
-
-			SelfList<TextureInfo> *next = E->next();
-			E->remove_from_list();
-			E = next;
-		}
 	}
 
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
@@ -3584,13 +3947,22 @@ void RenderingDeviceDriverD3D12::_command_check_descriptor_sets(CommandBufferID 
 	}
 }
 
-void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index, bool p_for_compute) {
+void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index, uint32_t p_dynamic_offsets, bool p_for_compute) {
 	_command_check_descriptor_sets(p_cmd_buffer);
+
+	uint32_t shift = 0u;
 
 	UniformSetInfo *uniform_set_info = (UniformSetInfo *)p_uniform_set.id;
 	const ShaderInfo *shader_info_in = (const ShaderInfo *)p_shader.id;
 	const ShaderInfo::UniformSet &shader_set = shader_info_in->sets[p_set_index];
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+
+	// The value of p_dynamic_offsets depends on all the other UniformSets bound after us
+	// (caller already filtered out bits that came before us).
+	// Turn that mask into something that is unique to us, *so that we don't create unnecessary entries in the cache*.
+	// We may not even have dynamic buffers at all in this set. In that case p_dynamic_offsets becomes 0.
+	const uint32_t used_dynamic_buffers_mask = (1u << (uniform_set_info->dynamic_buffers.size() * 4u)) - 1u;
+	p_dynamic_offsets = p_dynamic_offsets & used_dynamic_buffers_mask;
 
 	using SetRootDescriptorTableFn = void (STDMETHODCALLTYPE ID3D12GraphicsCommandList::*)(UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 	SetRootDescriptorTableFn set_root_desc_table_fn = p_for_compute ? &ID3D12GraphicsCommandList::SetComputeRootDescriptorTable : &ID3D12GraphicsCommandList1::SetGraphicsRootDescriptorTable;
@@ -3600,7 +3972,8 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 	UniformSetInfo::RecentBind *last_bind = nullptr;
 	for (int i = 0; i < (int)ARRAY_SIZE(uniform_set_info->recent_binds); i++) {
 		if (uniform_set_info->recent_binds[i].segment_serial == frames[frame_idx].segment_serial) {
-			if (uniform_set_info->recent_binds[i].root_signature_crc == root_sig_crc) {
+			if (uniform_set_info->recent_binds[i].root_signature_crc == root_sig_crc &&
+					uniform_set_info->recent_binds[i].dynamic_state_mask == p_dynamic_offsets) {
 				for (const RootDescriptorTable &table : uniform_set_info->recent_binds[i].root_tables.resources) {
 					(cmd_buf_info->cmd_list.Get()->*set_root_desc_table_fn)(table.root_param_idx, table.start_gpu_handle);
 				}
@@ -3626,23 +3999,24 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 	}
 
 	struct {
-		DescriptorsHeap::Walker *resources = nullptr;
-		DescriptorsHeap::Walker *samplers = nullptr;
+		GPUDescriptorsHeapWalker *resources = nullptr;
+		GPUDescriptorsHeapWalker *samplers = nullptr;
 	} frame_heap_walkers;
 	frame_heap_walkers.resources = &frames[frame_idx].desc_heap_walkers.resources;
 	frame_heap_walkers.samplers = &frames[frame_idx].desc_heap_walkers.samplers;
 
 	struct {
-		DescriptorsHeap::Walker resources;
-		DescriptorsHeap::Walker samplers;
+		CPUDescriptorsHeapWalker resources;
+		CPUDescriptorsHeapWalker samplers;
 	} set_heap_walkers;
 	set_heap_walkers.resources = uniform_set_info->desc_heaps.resources.make_walker();
 	set_heap_walkers.samplers = uniform_set_info->desc_heaps.samplers.make_walker();
 
+	const uint32_t binding_count = shader_set.bindings.size();
 #ifdef DEV_ENABLED
 	// Whether we have stages where the uniform is actually used should match
 	// whether we have any root signature locations for it.
-	for (uint32_t i = 0; i < shader_set.bindings.size(); i++) {
+	for (uint32_t i = 0; i < binding_count; i++) {
 		bool has_rs_locations = false;
 		if (shader_set.bindings[i].root_sig_locations.resource.root_param_idx != UINT32_MAX ||
 				shader_set.bindings[i].root_sig_locations.sampler.root_param_idx != UINT32_MAX) {
@@ -3666,21 +4040,25 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 		RootDescriptorTable *resources = nullptr;
 		RootDescriptorTable *samplers = nullptr;
 	} tables;
-	for (uint32_t i = 0; i < shader_set.bindings.size(); i++) {
+	for (uint32_t i = 0; i < binding_count; i++) {
 		const ShaderInfo::UniformBindingInfo &binding = shader_set.bindings[i];
 
 		uint32_t num_resource_descs = 0;
 		uint32_t num_sampler_descs = 0;
 		bool srv_uav_ambiguity = false;
-		_add_descriptor_count_for_uniform(binding.type, binding.length, false, num_resource_descs, num_sampler_descs, srv_uav_ambiguity);
+		const uint32_t frame_count_for_binding = 1u; // _add_descriptor_count_for_uniform wants frames.size() so we can create N entries.
+													 // However we are binding now, and we must bind only one (not N of them), so set 1u.
+		_add_descriptor_count_for_uniform(binding.type, binding.length, false, num_resource_descs, num_sampler_descs, srv_uav_ambiguity, frame_count_for_binding);
+
+		uint32_t dynamic_resources_to_skip = 0u;
 
 		bool resource_used = false;
-		if (shader_set.bindings[i].stages) {
+		if (binding.stages) {
 			{
-				const ShaderInfo::UniformBindingInfo::RootSignatureLocation &rs_loc_resource = shader_set.bindings[i].root_sig_locations.resource;
+				const ShaderInfo::UniformBindingInfo::RootSignatureLocation &rs_loc_resource = binding.root_sig_locations.resource;
 				if (rs_loc_resource.root_param_idx != UINT32_MAX) { // Location used?
 					DEV_ASSERT(num_resource_descs);
-					DEV_ASSERT(!(srv_uav_ambiguity && (shader_set.bindings[i].res_class != RES_CLASS_SRV && shader_set.bindings[i].res_class != RES_CLASS_UAV))); // [[SRV_UAV_AMBIGUITY]]
+					DEV_ASSERT(!(srv_uav_ambiguity && (binding.res_class != RES_CLASS_SRV && binding.res_class != RES_CLASS_UAV))); // [[SRV_UAV_AMBIGUITY]]
 
 					bool must_flush_table = tables.resources && rs_loc_resource.root_param_idx != tables.resources->root_param_idx;
 					if (must_flush_table) {
@@ -3694,7 +4072,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 					if (unlikely(frame_heap_walkers.resources->get_free_handles() < num_resource_descs)) {
 						if (!frames[frame_idx].desc_heaps_exhausted_reported.resources) {
 							frames[frame_idx].desc_heaps_exhausted_reported.resources = true;
-							ERR_FAIL_MSG("Cannot bind uniform set because there's no enough room in current frame's RESOURCES descriptor heap.\n"
+							ERR_FAIL_MSG("Cannot bind uniform set because there's not enough room in the current frame's RESOURCES descriptor heap.\n"
 										 "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors_per_frame project setting.");
 						} else {
 							return;
@@ -3709,8 +4087,16 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 						tables.resources->start_gpu_handle = frame_heap_walkers.resources->get_curr_gpu_handle();
 					}
 
+					// For dynamic buffers, jump to the last written offset.
+					if (binding.type == UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC || binding.type == UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC) {
+						const uint32_t dyn_frame_idx = (p_dynamic_offsets >> shift) & 0xFu;
+						shift += 4u;
+						set_heap_walkers.resources.advance(num_resource_descs * dyn_frame_idx);
+						dynamic_resources_to_skip = num_resource_descs * (frames.size() - dyn_frame_idx - 1u);
+					}
+
 					// If there is ambiguity and it didn't clarify as SRVs, skip them, which come first. [[SRV_UAV_AMBIGUITY]]
-					if (srv_uav_ambiguity && shader_set.bindings[i].res_class != RES_CLASS_SRV) {
+					if (srv_uav_ambiguity && binding.res_class != RES_CLASS_SRV) {
 						set_heap_walkers.resources.advance(num_resource_descs);
 					}
 
@@ -3723,7 +4109,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 					frame_heap_walkers.resources->advance(num_resource_descs);
 
 					// If there is ambiguity and it didn't clarify as UAVs, skip them, which come later. [[SRV_UAV_AMBIGUITY]]
-					if (srv_uav_ambiguity && shader_set.bindings[i].res_class != RES_CLASS_UAV) {
+					if (srv_uav_ambiguity && binding.res_class != RES_CLASS_UAV) {
 						set_heap_walkers.resources.advance(num_resource_descs);
 					}
 
@@ -3732,7 +4118,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 			}
 
 			{
-				const ShaderInfo::UniformBindingInfo::RootSignatureLocation &rs_loc_sampler = shader_set.bindings[i].root_sig_locations.sampler;
+				const ShaderInfo::UniformBindingInfo::RootSignatureLocation &rs_loc_sampler = binding.root_sig_locations.sampler;
 				if (rs_loc_sampler.root_param_idx != UINT32_MAX) { // Location used?
 					DEV_ASSERT(num_sampler_descs);
 					DEV_ASSERT(!srv_uav_ambiguity); // [[SRV_UAV_AMBIGUITY]]
@@ -3749,7 +4135,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 					if (unlikely(frame_heap_walkers.samplers->get_free_handles() < num_sampler_descs)) {
 						if (!frames[frame_idx].desc_heaps_exhausted_reported.samplers) {
 							frames[frame_idx].desc_heaps_exhausted_reported.samplers = true;
-							ERR_FAIL_MSG("Cannot bind uniform set because there's no enough room in current frame's SAMPLERS descriptors heap.\n"
+							ERR_FAIL_MSG("Cannot bind uniform set because there's not enough room in the current frame's SAMPLERS descriptors heap.\n"
 										 "Please increase the value of the rendering/rendering_device/d3d12/max_sampler_descriptors_per_frame project setting.");
 						} else {
 							return;
@@ -3779,7 +4165,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 		// the shader variant a given set is created upon may not need all of them due to DXC optimizations.
 		// Therefore, at this point we have to advance through the descriptor set descriptor's heap unconditionally.
 
-		set_heap_walkers.resources.advance(num_resource_descs);
+		set_heap_walkers.resources.advance(num_resource_descs + dynamic_resources_to_skip);
 		if (srv_uav_ambiguity) {
 			DEV_ASSERT(num_resource_descs);
 			if (!resource_used) {
@@ -3808,6 +4194,7 @@ void RenderingDeviceDriverD3D12::_command_bind_uniform_set(CommandBufferID p_cmd
 
 	last_bind->root_signature_crc = root_sig_crc;
 	last_bind->segment_serial = frames[frame_idx].segment_serial;
+	last_bind->dynamic_state_mask = p_dynamic_offsets;
 }
 
 /******************/
@@ -3824,7 +4211,7 @@ void RenderingDeviceDriverD3D12::command_clear_buffer(CommandBufferID p_cmd_buff
 		if (!frames[frame_idx].desc_heaps_exhausted_reported.resources) {
 			frames[frame_idx].desc_heaps_exhausted_reported.resources = true;
 			ERR_FAIL_MSG(
-					"Cannot clear buffer because there's no enough room in current frame's RESOURCE descriptors heap.\n"
+					"Cannot clear buffer because there's not enough room in the current frame's RESOURCE descriptors heap.\n"
 					"Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors_per_frame project setting.");
 		} else {
 			return;
@@ -3834,7 +4221,7 @@ void RenderingDeviceDriverD3D12::command_clear_buffer(CommandBufferID p_cmd_buff
 		if (!frames[frame_idx].desc_heaps_exhausted_reported.aux) {
 			frames[frame_idx].desc_heaps_exhausted_reported.aux = true;
 			ERR_FAIL_MSG(
-					"Cannot clear buffer because there's no enough room in current frame's AUX descriptors heap.\n"
+					"Cannot clear buffer because there's not enough room in the current frame's AUX descriptors heap.\n"
 					"Please increase the value of the rendering/rendering_device/d3d12/max_misc_descriptors_per_frame project setting.");
 		} else {
 			return;
@@ -3979,7 +4366,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 			if (!frames[frame_idx].desc_heaps_exhausted_reported.rtv) {
 				frames[frame_idx].desc_heaps_exhausted_reported.rtv = true;
 				ERR_FAIL_MSG(
-						"Cannot clear texture because there's no enough room in current frame's RENDER TARGET descriptors heap.\n"
+						"Cannot clear texture because there's not enough room in the current frame's RENDER TARGET descriptors heap.\n"
 						"Please increase the value of the rendering/rendering_device/d3d12/max_misc_descriptors_per_frame project setting.");
 			} else {
 				return;
@@ -4014,7 +4401,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 			if (!frames[frame_idx].desc_heaps_exhausted_reported.resources) {
 				frames[frame_idx].desc_heaps_exhausted_reported.resources = true;
 				ERR_FAIL_MSG(
-						"Cannot clear texture because there's no enough room in current frame's RESOURCE descriptors heap.\n"
+						"Cannot clear texture because there's not enough room in the current frame's RESOURCE descriptors heap.\n"
 						"Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors_per_frame project setting.");
 			} else {
 				return;
@@ -4024,7 +4411,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 			if (!frames[frame_idx].desc_heaps_exhausted_reported.aux) {
 				frames[frame_idx].desc_heaps_exhausted_reported.aux = true;
 				ERR_FAIL_MSG(
-						"Cannot clear texture because there's no enough room in current frame's AUX descriptors heap.\n"
+						"Cannot clear texture because there's not enough room in the current frame's AUX descriptors heap.\n"
 						"Please increase the value of the rendering/rendering_device/d3d12/max_misc_descriptors_per_frame project setting.");
 			} else {
 				return;
@@ -4075,17 +4462,17 @@ void RenderingDeviceDriverD3D12::command_copy_buffer_to_texture(CommandBufferID 
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	BufferInfo *buf_info = (BufferInfo *)p_src_buffer.id;
 	TextureInfo *tex_info = (TextureInfo *)p_dst_texture.id;
+
 	if (!barrier_capabilities.enhanced_barriers_supported) {
 		_resource_transition_batch(cmd_buf_info, buf_info, 0, 1, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	}
 
-	uint32_t pixel_size = get_image_format_pixel_size(tex_info->format);
 	uint32_t block_w = 0, block_h = 0;
 	get_compressed_image_format_block_dimensions(tex_info->format, block_w, block_h);
 
 	for (uint32_t i = 0; i < p_regions.size(); i++) {
-		uint32_t region_pitch = (p_regions[i].texture_region_size.x * pixel_size * block_w) >> get_compressed_image_format_pixel_rshift(tex_info->format);
-		region_pitch = STEPIFY(region_pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+		DEV_ASSERT((p_regions[i].buffer_offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1)) == 0 && "Buffer offset must be aligned to 512 bytes. See API_TRAIT_TEXTURE_TRANSFER_ALIGNMENT.");
+		DEV_ASSERT((p_regions[i].row_pitch & (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) == 0 && "Row pitch must be aligned to 256 bytes. See API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP.");
 
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint = {};
 		src_footprint.Offset = p_regions[i].buffer_offset;
@@ -4094,48 +4481,31 @@ void RenderingDeviceDriverD3D12::command_copy_buffer_to_texture(CommandBufferID 
 				STEPIFY(p_regions[i].texture_region_size.x, block_w),
 				STEPIFY(p_regions[i].texture_region_size.y, block_h),
 				p_regions[i].texture_region_size.z,
-				region_pitch);
+				p_regions[i].row_pitch);
+
 		CD3DX12_TEXTURE_COPY_LOCATION copy_src(buf_info->resource, src_footprint);
 
-		CD3DX12_BOX src_box(
-				0, 0, 0,
-				STEPIFY(p_regions[i].texture_region_size.x, block_w),
-				STEPIFY(p_regions[i].texture_region_size.y, block_h),
-				p_regions[i].texture_region_size.z);
+		UINT dst_subresource = D3D12CalcSubresource(
+				p_regions[i].texture_subresource.mipmap,
+				p_regions[i].texture_subresource.layer,
+				_compute_plane_slice(tex_info->format, p_regions[i].texture_subresource.aspect),
+				tex_info->desc.MipLevels,
+				tex_info->desc.ArraySize());
 
 		if (!barrier_capabilities.enhanced_barriers_supported) {
-			for (uint32_t j = 0; j < p_regions[i].texture_subresources.layer_count; j++) {
-				UINT dst_subresource = D3D12CalcSubresource(
-						p_regions[i].texture_subresources.mipmap,
-						p_regions[i].texture_subresources.base_layer + j,
-						_compute_plane_slice(tex_info->format, p_regions[i].texture_subresources.aspect),
-						tex_info->desc.MipLevels,
-						tex_info->desc.ArraySize());
-				CD3DX12_TEXTURE_COPY_LOCATION copy_dst(tex_info->resource, dst_subresource);
-
-				_resource_transition_batch(cmd_buf_info, tex_info, dst_subresource, 1, D3D12_RESOURCE_STATE_COPY_DEST);
-			}
-
+			_resource_transition_batch(cmd_buf_info, tex_info, dst_subresource, 1, D3D12_RESOURCE_STATE_COPY_DEST);
 			_resource_transitions_flush(cmd_buf_info);
 		}
 
-		for (uint32_t j = 0; j < p_regions[i].texture_subresources.layer_count; j++) {
-			UINT dst_subresource = D3D12CalcSubresource(
-					p_regions[i].texture_subresources.mipmap,
-					p_regions[i].texture_subresources.base_layer + j,
-					_compute_plane_slice(tex_info->format, p_regions[i].texture_subresources.aspect),
-					tex_info->desc.MipLevels,
-					tex_info->desc.ArraySize());
-			CD3DX12_TEXTURE_COPY_LOCATION copy_dst(tex_info->resource, dst_subresource);
+		CD3DX12_TEXTURE_COPY_LOCATION copy_dst(tex_info->resource, dst_subresource);
 
-			cmd_buf_info->cmd_list->CopyTextureRegion(
-					&copy_dst,
-					p_regions[i].texture_offset.x,
-					p_regions[i].texture_offset.y,
-					p_regions[i].texture_offset.z,
-					&copy_src,
-					&src_box);
-		}
+		cmd_buf_info->cmd_list->CopyTextureRegion(
+				&copy_dst,
+				p_regions[i].texture_offset.x,
+				p_regions[i].texture_offset.y,
+				p_regions[i].texture_offset.z,
+				&copy_src,
+				nullptr);
 	}
 }
 
@@ -4152,53 +4522,56 @@ void RenderingDeviceDriverD3D12::command_copy_texture_to_buffer(CommandBufferID 
 	get_compressed_image_format_block_dimensions(tex_info->format, block_w, block_h);
 
 	for (uint32_t i = 0; i < p_regions.size(); i++) {
+		DEV_ASSERT((p_regions[i].buffer_offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1)) == 0 && "Buffer offset must be aligned to 512 bytes. See API_TRAIT_TEXTURE_TRANSFER_ALIGNMENT.");
+		DEV_ASSERT((p_regions[i].row_pitch & (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) == 0 && "Row pitch must be aligned to 256 bytes. See API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP.");
+
+		UINT src_subresource = D3D12CalcSubresource(
+				p_regions[i].texture_subresource.mipmap,
+				p_regions[i].texture_subresource.layer,
+				_compute_plane_slice(tex_info->format, p_regions[i].texture_subresource.aspect),
+				tex_info->desc.MipLevels,
+				tex_info->desc.ArraySize());
+
 		if (!barrier_capabilities.enhanced_barriers_supported) {
-			for (uint32_t j = 0; j < p_regions[i].texture_subresources.layer_count; j++) {
-				UINT src_subresource = D3D12CalcSubresource(
-						p_regions[i].texture_subresources.mipmap,
-						p_regions[i].texture_subresources.base_layer + j,
-						_compute_plane_slice(tex_info->format, p_regions[i].texture_subresources.aspect),
-						tex_info->desc.MipLevels,
-						tex_info->desc.ArraySize());
-
-				_resource_transition_batch(cmd_buf_info, tex_info, src_subresource, 1, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			}
-
+			_resource_transition_batch(cmd_buf_info, tex_info, src_subresource, 1, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			_resource_transitions_flush(cmd_buf_info);
 		}
 
-		for (uint32_t j = 0; j < p_regions[i].texture_subresources.layer_count; j++) {
-			UINT src_subresource = D3D12CalcSubresource(
-					p_regions[i].texture_subresources.mipmap,
-					p_regions[i].texture_subresources.base_layer + j,
-					_compute_plane_slice(tex_info->format, p_regions[i].texture_subresources.aspect),
-					tex_info->desc.MipLevels,
-					tex_info->desc.ArraySize());
+		CD3DX12_TEXTURE_COPY_LOCATION copy_src(tex_info->resource, src_subresource);
 
-			CD3DX12_TEXTURE_COPY_LOCATION copy_src(tex_info->resource, src_subresource);
+		CD3DX12_BOX src_box(
+				p_regions[i].texture_offset.x,
+				p_regions[i].texture_offset.y,
+				p_regions[i].texture_offset.z,
+				p_regions[i].texture_offset.x + STEPIFY(p_regions[i].texture_region_size.x, block_w),
+				p_regions[i].texture_offset.y + STEPIFY(p_regions[i].texture_region_size.y, block_h),
+				p_regions[i].texture_offset.z + p_regions[i].texture_region_size.z);
 
-			uint32_t computed_d = MAX(1, tex_info->desc.DepthOrArraySize >> p_regions[i].texture_subresources.mipmap);
-			uint32_t image_size = get_image_format_required_size(
-					tex_info->format,
-					MAX(1u, tex_info->desc.Width >> p_regions[i].texture_subresources.mipmap),
-					MAX(1u, tex_info->desc.Height >> p_regions[i].texture_subresources.mipmap),
-					computed_d,
-					1);
-			uint32_t row_pitch = image_size / (p_regions[i].texture_region_size.y * computed_d) * block_h;
-			row_pitch = STEPIFY(row_pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+		bool full_box =
+				src_box.left == 0 &&
+				src_box.top == 0 &&
+				src_box.front == 0 &&
+				src_box.right == tex_info->desc.Width &&
+				src_box.bottom == tex_info->desc.Height &&
+				src_box.back == tex_info->desc.Depth();
 
-			D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_footprint = {};
-			dst_footprint.Offset = p_regions[i].buffer_offset;
-			dst_footprint.Footprint.Width = STEPIFY(p_regions[i].texture_region_size.x, block_w);
-			dst_footprint.Footprint.Height = STEPIFY(p_regions[i].texture_region_size.y, block_h);
-			dst_footprint.Footprint.Depth = p_regions[i].texture_region_size.z;
-			dst_footprint.Footprint.RowPitch = row_pitch;
-			dst_footprint.Footprint.Format = RD_TO_D3D12_FORMAT[tex_info->format].family;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_footprint = {};
+		dst_footprint.Offset = p_regions[i].buffer_offset;
+		dst_footprint.Footprint.Format = RD_TO_D3D12_FORMAT[tex_info->format].family;
+		dst_footprint.Footprint.Width = STEPIFY(p_regions[i].texture_region_size.x, block_w);
+		dst_footprint.Footprint.Height = STEPIFY(p_regions[i].texture_region_size.y, block_h);
+		dst_footprint.Footprint.Depth = p_regions[i].texture_region_size.z;
+		dst_footprint.Footprint.RowPitch = p_regions[i].row_pitch;
 
-			CD3DX12_TEXTURE_COPY_LOCATION copy_dst(buf_info->resource, dst_footprint);
+		CD3DX12_TEXTURE_COPY_LOCATION copy_dst(buf_info->resource, dst_footprint);
 
-			cmd_buf_info->cmd_list->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr);
-		}
+		cmd_buf_info->cmd_list->CopyTextureRegion(
+				&copy_dst,
+				0,
+				0,
+				0,
+				&copy_src,
+				full_box ? nullptr : &src_box);
 	}
 }
 
@@ -4208,7 +4581,6 @@ void RenderingDeviceDriverD3D12::command_copy_texture_to_buffer(CommandBufferID 
 
 void RenderingDeviceDriverD3D12::pipeline_free(PipelineID p_pipeline) {
 	PipelineInfo *pipeline_info = (PipelineInfo *)(p_pipeline.id);
-	pipeline_info->pso->Release();
 	memdelete(pipeline_info);
 }
 
@@ -4342,14 +4714,22 @@ void RenderingDeviceDriverD3D12::command_begin_render_pass(CommandBufferID p_cmd
 			p_rect.position.y,
 			p_rect.position.x + p_rect.size.x,
 			p_rect.position.y + p_rect.size.y);
-	cmd_buf_info->render_pass_state.region_is_all = !(
-			cmd_buf_info->render_pass_state.region_rect.left == 0 &&
+	cmd_buf_info->render_pass_state.region_is_all = (cmd_buf_info->render_pass_state.region_rect.left == 0 &&
 			cmd_buf_info->render_pass_state.region_rect.top == 0 &&
 			cmd_buf_info->render_pass_state.region_rect.right == fb_info->size.x &&
 			cmd_buf_info->render_pass_state.region_rect.bottom == fb_info->size.y);
 
+	cmd_buf_info->render_pass_state.attachment_layouts.resize(pass_info->attachments.size());
+
 	for (uint32_t i = 0; i < pass_info->attachments.size(); i++) {
-		if (pass_info->attachments[i].load_op == ATTACHMENT_LOAD_OP_DONT_CARE) {
+		const Attachment &attachment = pass_info->attachments[i];
+
+		for (RenderPassState::AttachmentLayout::AspectLayout &aspect_layout : cmd_buf_info->render_pass_state.attachment_layouts[i].aspect_layouts) {
+			aspect_layout.cur_layout = attachment.initial_layout;
+			aspect_layout.expected_layout = attachment.initial_layout;
+		}
+
+		if (attachment.load_op == ATTACHMENT_LOAD_OP_DONT_CARE) {
 			const TextureInfo *tex_info = (const TextureInfo *)fb_info->attachments[i].id;
 			_discard_texture_subresources(tex_info, cmd_buf_info);
 		}
@@ -4387,11 +4767,13 @@ void RenderingDeviceDriverD3D12::command_begin_render_pass(CommandBufferID p_cmd
 			if (pass_info->attachments[i].load_op == ATTACHMENT_LOAD_OP_CLEAR) {
 				clear.aspect.set_flag(TEXTURE_ASPECT_COLOR_BIT);
 				clear.color_attachment = i;
-				tex_info->pending_clear.remove_from_list();
 			}
 		} else if ((tex_info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
-			if (pass_info->attachments[i].stencil_load_op == ATTACHMENT_LOAD_OP_CLEAR) {
+			if (pass_info->attachments[i].load_op == ATTACHMENT_LOAD_OP_CLEAR) {
 				clear.aspect.set_flag(TEXTURE_ASPECT_DEPTH_BIT);
+			}
+			if (pass_info->attachments[i].stencil_load_op == ATTACHMENT_LOAD_OP_CLEAR) {
+				clear.aspect.set_flag(TEXTURE_ASPECT_STENCIL_BIT);
 			}
 		}
 		if (!clear.aspect.is_empty()) {
@@ -4404,6 +4786,91 @@ void RenderingDeviceDriverD3D12::command_begin_render_pass(CommandBufferID p_cmd
 
 	if (num_clears) {
 		command_render_clear_attachments(p_cmd_buffer, VectorView(clears, num_clears), VectorView(clear_rects, num_clears));
+	}
+}
+
+// Subpass dependencies cannot be specified by the end user, and by default they are very aggressive.
+// We can be more lenient by just looking at the texture layout and specifying appropriate access and stage bits.
+
+// We specify full barrier for layouts we don't expect to see as fallback.
+static const BitField<RDD::BarrierAccessBits> RD_RENDER_PASS_LAYOUT_TO_ACCESS_BITS[RDD::TEXTURE_LAYOUT_MAX] = {
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_UNDEFINED
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_GENERAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_STORAGE_OPTIMAL
+	RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, // TEXTURE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+	RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, // TEXTURE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+	RDD::BARRIER_ACCESS_SHADER_READ_BIT, // TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_COPY_SRC_OPTIMAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_COPY_DST_OPTIMAL
+	RDD::BARRIER_ACCESS_RESOLVE_READ_BIT, // TEXTURE_LAYOUT_RESOLVE_SRC_OPTIMAL
+	RDD::BARRIER_ACCESS_RESOLVE_WRITE_BIT, // TEXTURE_LAYOUT_RESOLVE_DST_OPTIMAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT, // TEXTURE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL
+	RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT // TEXTURE_LAYOUT_FRAGMENT_DENSITY_MAP_ATTACHMENT_OPTIMAL
+};
+
+// We specify all commands for layouts we don't expect to see as fallback.
+static const BitField<RDD::PipelineStageBits> RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[RDD::TEXTURE_LAYOUT_MAX] = {
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_UNDEFINED
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_GENERAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_STORAGE_OPTIMAL
+	RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, // TEXTURE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+	RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, // TEXTURE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+	RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT, // TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_COPY_SRC_OPTIMAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_COPY_DST_OPTIMAL
+	RDD::PIPELINE_STAGE_RESOLVE_BIT, // TEXTURE_LAYOUT_RESOLVE_SRC_OPTIMAL
+	RDD::PIPELINE_STAGE_RESOLVE_BIT, // TEXTURE_LAYOUT_RESOLVE_DST_OPTIMAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, // TEXTURE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL
+	RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT // TEXTURE_LAYOUT_FRAGMENT_DENSITY_MAP_ATTACHMENT_OPTIMAL
+};
+
+void RenderingDeviceDriverD3D12::_render_pass_enhanced_barriers_flush(CommandBufferID p_cmd_buffer) {
+	if (!barrier_capabilities.enhanced_barriers_supported) {
+		return;
+	}
+
+	BitField<PipelineStageBits> src_stages = {};
+	BitField<PipelineStageBits> dst_stages = {};
+
+	thread_local LocalVector<TextureBarrier> texture_barriers;
+	texture_barriers.clear();
+
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
+
+	for (uint32_t i = 0; i < cmd_buf_info->render_pass_state.attachment_layouts.size(); i++) {
+		RenderPassState::AttachmentLayout &attachment_layout = cmd_buf_info->render_pass_state.attachment_layouts[i];
+		TextureID tex = cmd_buf_info->render_pass_state.fb_info->attachments[i];
+		TextureInfo *tex_info = (TextureInfo *)tex.id;
+
+		for (uint32_t j = 0; j < TEXTURE_ASPECT_MAX; j++) {
+			RenderPassState::AttachmentLayout::AspectLayout &aspect_layout = attachment_layout.aspect_layouts[j];
+
+			if (aspect_layout.cur_layout != aspect_layout.expected_layout) {
+				src_stages = src_stages | RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.cur_layout];
+				dst_stages = dst_stages | RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.expected_layout];
+
+				TextureBarrier texture_barrier;
+				texture_barrier.texture = tex;
+				texture_barrier.src_access = RD_RENDER_PASS_LAYOUT_TO_ACCESS_BITS[aspect_layout.cur_layout];
+				texture_barrier.dst_access = RD_RENDER_PASS_LAYOUT_TO_ACCESS_BITS[aspect_layout.expected_layout];
+				texture_barrier.prev_layout = aspect_layout.cur_layout;
+				texture_barrier.next_layout = aspect_layout.expected_layout;
+				texture_barrier.subresources.aspect = (TextureAspectBits)(1 << j);
+				texture_barrier.subresources.base_mipmap = tex_info->base_mip;
+				texture_barrier.subresources.mipmap_count = tex_info->mipmaps;
+				texture_barrier.subresources.base_layer = tex_info->base_layer;
+				texture_barrier.subresources.layer_count = tex_info->layers;
+				texture_barriers.push_back(texture_barrier);
+
+				aspect_layout.cur_layout = aspect_layout.expected_layout;
+			}
+		}
+	}
+
+	if (!texture_barriers.is_empty()) {
+		command_pipeline_barrier(p_cmd_buffer, src_stages, dst_stages, VectorView<MemoryAccessBarrier>(), VectorView<BufferBarrier>(), texture_barriers);
 	}
 }
 
@@ -4445,11 +4912,22 @@ void RenderingDeviceDriverD3D12::_end_render_pass(CommandBufferID p_cmd_buffer) 
 
 		TextureInfo *src_tex_info = (TextureInfo *)fb_info->attachments[color_index].id;
 		uint32_t src_subresource = D3D12CalcSubresource(src_tex_info->base_mip, src_tex_info->base_layer, 0, src_tex_info->desc.MipLevels, src_tex_info->desc.ArraySize());
-		_resource_transition_batch(cmd_buf_info, src_tex_info, src_subresource, 1, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+
+		if (barrier_capabilities.enhanced_barriers_supported) {
+			cmd_buf_info->render_pass_state.attachment_layouts[color_index].aspect_layouts[TEXTURE_ASPECT_COLOR].expected_layout = TEXTURE_LAYOUT_RESOLVE_SRC_OPTIMAL;
+		} else {
+			_resource_transition_batch(cmd_buf_info, src_tex_info, src_subresource, 1, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+		}
 
 		TextureInfo *dst_tex_info = (TextureInfo *)fb_info->attachments[resolve_index].id;
 		uint32_t dst_subresource = D3D12CalcSubresource(dst_tex_info->base_mip, dst_tex_info->base_layer, 0, dst_tex_info->desc.MipLevels, dst_tex_info->desc.ArraySize());
-		_resource_transition_batch(cmd_buf_info, dst_tex_info, dst_subresource, 1, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+
+		if (barrier_capabilities.enhanced_barriers_supported) {
+			// This should have already been done when beginning the subpass.
+			DEV_ASSERT(cmd_buf_info->render_pass_state.attachment_layouts[resolve_index].aspect_layouts[TEXTURE_ASPECT_COLOR].expected_layout == TEXTURE_LAYOUT_RESOLVE_DST_OPTIMAL);
+		} else {
+			_resource_transition_batch(cmd_buf_info, dst_tex_info, dst_subresource, 1, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+		}
 
 		resolves[num_resolves].src_res = src_tex_info->resource;
 		resolves[num_resolves].src_subres = src_subresource;
@@ -4460,6 +4938,11 @@ void RenderingDeviceDriverD3D12::_end_render_pass(CommandBufferID p_cmd_buffer) 
 	}
 
 	_resource_transitions_flush(cmd_buf_info);
+
+	// There can be enhanced barriers to flush only when we need to resolve textures.
+	if (num_resolves != 0) {
+		_render_pass_enhanced_barriers_flush(p_cmd_buffer);
+	}
 
 	for (uint32_t i = 0; i < num_resolves; i++) {
 		cmd_buf_info->cmd_list->ResolveSubresource(resolves[i].dst_res, resolves[i].dst_subres, resolves[i].src_res, resolves[i].src_subres, resolves[i].format);
@@ -4482,6 +4965,16 @@ void RenderingDeviceDriverD3D12::command_end_render_pass(CommandBufferID p_cmd_b
 			cmd_list_5->RSSetShadingRateImage(nullptr);
 		}
 	}
+
+	for (uint32_t i = 0; i < pass_info->attachments.size(); i++) {
+		const Attachment &attachment = pass_info->attachments[i];
+
+		for (RenderPassState::AttachmentLayout::AspectLayout &aspect_layout : cmd_buf_info->render_pass_state.attachment_layouts[i].aspect_layouts) {
+			aspect_layout.expected_layout = attachment.final_layout;
+		}
+	}
+
+	_render_pass_enhanced_barriers_flush(p_cmd_buffer);
 
 	for (uint32_t i = 0; i < pass_info->attachments.size(); i++) {
 		if (pass_info->attachments[i].store_op == ATTACHMENT_STORE_OP_DONT_CARE) {
@@ -4507,10 +5000,27 @@ void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_c
 	const RenderPassInfo *pass_info = cmd_buf_info->render_pass_state.pass_info;
 	const Subpass &subpass = pass_info->subpasses[cmd_buf_info->render_pass_state.current_subpass];
 
+	for (uint32_t i = 0; i < subpass.input_references.size(); i++) {
+		const AttachmentReference &input_reference = subpass.input_references[i];
+		uint32_t attachment = input_reference.attachment;
+
+		if (attachment != AttachmentReference::UNUSED) {
+			RenderPassState::AttachmentLayout &attachment_layout = cmd_buf_info->render_pass_state.attachment_layouts[attachment];
+
+			// Vulkan cares about aspect bits only for input attachments.
+			for (uint32_t j = 0; j < TEXTURE_ASPECT_MAX; j++) {
+				if (input_reference.aspect & (1 << j)) {
+					attachment_layout.aspect_layouts[j].expected_layout = input_reference.layout;
+				}
+			}
+		}
+	}
+
 	D3D12_CPU_DESCRIPTOR_HANDLE *rtv_handles = ALLOCA_ARRAY(D3D12_CPU_DESCRIPTOR_HANDLE, subpass.color_references.size());
-	DescriptorsHeap::Walker rtv_heap_walker = fb_info->rtv_heap.make_walker();
+	CPUDescriptorsHeapWalker rtv_heap_walker = fb_info->rtv_heap.make_walker();
 	for (uint32_t i = 0; i < subpass.color_references.size(); i++) {
-		uint32_t attachment = subpass.color_references[i].attachment;
+		const AttachmentReference &color_reference = subpass.color_references[i];
+		uint32_t attachment = color_reference.attachment;
 		if (attachment == AttachmentReference::UNUSED) {
 			if (!frames[frame_idx].null_rtv_handle.ptr) {
 				// No null descriptor-handle created for this frame yet.
@@ -4518,7 +5028,7 @@ void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_c
 				if (frames[frame_idx].desc_heap_walkers.rtv.is_at_eof()) {
 					if (!frames[frame_idx].desc_heaps_exhausted_reported.rtv) {
 						frames[frame_idx].desc_heaps_exhausted_reported.rtv = true;
-						ERR_FAIL_MSG("Cannot begin subpass because there's no enough room in current frame's RENDER TARGET descriptors heap.\n"
+						ERR_FAIL_MSG("Cannot begin subpass because there's not enough room in the current frame's RENDER TARGET descriptors heap.\n"
 									 "Please increase the value of the rendering/rendering_device/d3d12/max_misc_descriptors_per_frame project setting.");
 					} else {
 						return;
@@ -4538,19 +5048,38 @@ void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_c
 			rtv_heap_walker.rewind();
 			rtv_heap_walker.advance(rt_index);
 			rtv_handles[i] = rtv_heap_walker.get_curr_cpu_handle();
+
+			cmd_buf_info->render_pass_state.attachment_layouts[attachment].aspect_layouts[TEXTURE_ASPECT_COLOR].expected_layout = color_reference.layout;
 		}
 	}
 
 	D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = {};
 	{
-		DescriptorsHeap::Walker dsv_heap_walker = fb_info->dsv_heap.make_walker();
+		CPUDescriptorsHeapWalker dsv_heap_walker = fb_info->dsv_heap.make_walker();
 		if (subpass.depth_stencil_reference.attachment != AttachmentReference::UNUSED) {
 			uint32_t ds_index = fb_info->attachments_handle_inds[subpass.depth_stencil_reference.attachment];
 			dsv_heap_walker.rewind();
 			dsv_heap_walker.advance(ds_index);
 			dsv_handle = dsv_heap_walker.get_curr_cpu_handle();
+
+			RenderPassState::AttachmentLayout &attachment_layout = cmd_buf_info->render_pass_state.attachment_layouts[subpass.depth_stencil_reference.attachment];
+			attachment_layout.aspect_layouts[TEXTURE_ASPECT_DEPTH].expected_layout = subpass.depth_stencil_reference.layout;
+			attachment_layout.aspect_layouts[TEXTURE_ASPECT_STENCIL].expected_layout = subpass.depth_stencil_reference.layout;
 		}
 	}
+
+	for (uint32_t i = 0; i < subpass.resolve_references.size(); i++) {
+		const AttachmentReference &resolve_reference = subpass.resolve_references[i];
+		uint32_t attachment = resolve_reference.attachment;
+
+		if (attachment != AttachmentReference::UNUSED) {
+			// Vulkan expects the layout to be in color attachment layout, but D3D12 wants resolve destination.
+			DEV_ASSERT(resolve_reference.layout == TEXTURE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+			cmd_buf_info->render_pass_state.attachment_layouts[attachment].aspect_layouts[TEXTURE_ASPECT_COLOR].expected_layout = TEXTURE_LAYOUT_RESOLVE_DST_OPTIMAL;
+		}
+	}
+
+	_render_pass_enhanced_barriers_flush(p_cmd_buffer);
 
 	cmd_buf_info->cmd_list->OMSetRenderTargets(subpass.color_references.size(), rtv_handles, false, dsv_handle.ptr ? &dsv_handle : nullptr);
 }
@@ -4592,8 +5121,8 @@ void RenderingDeviceDriverD3D12::command_render_clear_attachments(CommandBufferI
 	const FramebufferInfo *fb_info = cmd_buf_info->render_pass_state.fb_info;
 	const RenderPassInfo *pass_info = cmd_buf_info->render_pass_state.pass_info;
 
-	DescriptorsHeap::Walker rtv_heap_walker = fb_info->rtv_heap.make_walker();
-	DescriptorsHeap::Walker dsv_heap_walker = fb_info->dsv_heap.make_walker();
+	CPUDescriptorsHeapWalker rtv_heap_walker = fb_info->rtv_heap.make_walker();
+	CPUDescriptorsHeapWalker dsv_heap_walker = fb_info->dsv_heap.make_walker();
 
 	for (uint32_t i = 0; i < p_attachment_clears.size(); i++) {
 		uint32_t attachment = UINT32_MAX;
@@ -4649,14 +5178,14 @@ void RenderingDeviceDriverD3D12::command_bind_render_pipeline(CommandBufferID p_
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	const PipelineInfo *pipeline_info = (const PipelineInfo *)p_pipeline.id;
 
-	if (cmd_buf_info->graphics_pso == pipeline_info->pso) {
+	if (cmd_buf_info->graphics_pso == pipeline_info->pso.Get()) {
 		return;
 	}
 
 	const ShaderInfo *shader_info_in = pipeline_info->shader_info;
 	const RenderPipelineInfo &render_info = pipeline_info->render_info;
 
-	cmd_buf_info->cmd_list->SetPipelineState(pipeline_info->pso);
+	cmd_buf_info->cmd_list->SetPipelineState(pipeline_info->pso.Get());
 	if (cmd_buf_info->graphics_root_signature_crc != shader_info_in->root_signature_crc) {
 		cmd_buf_info->cmd_list->SetGraphicsRootSignature(shader_info_in->root_signature.Get());
 		cmd_buf_info->graphics_root_signature_crc = shader_info_in->root_signature_crc;
@@ -4676,18 +5205,20 @@ void RenderingDeviceDriverD3D12::command_bind_render_pipeline(CommandBufferID p_
 
 	cmd_buf_info->render_pass_state.vf_info = render_info.vf_info;
 
-	cmd_buf_info->graphics_pso = pipeline_info->pso;
+	cmd_buf_info->graphics_pso = pipeline_info->pso.Get();
 	cmd_buf_info->compute_pso = nullptr;
 }
 
-void RenderingDeviceDriverD3D12::command_bind_render_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
-	_command_bind_uniform_set(p_cmd_buffer, p_uniform_set, p_shader, p_set_index, false);
-}
-
-void RenderingDeviceDriverD3D12::command_bind_render_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) {
+void RenderingDeviceDriverD3D12::command_bind_render_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+	uint32_t shift = 0u;
 	for (uint32_t i = 0u; i < p_set_count; ++i) {
 		// TODO: _command_bind_uniform_set() does WAAAAY too much stuff. A lot of it should be already cached in UniformSetID when uniform_set_create() was called. Binding is supposed to be a cheap operation, ideally a memcpy.
-		_command_bind_uniform_set(p_cmd_buffer, p_uniform_sets[i], p_shader, p_first_set_index + i, false);
+		_command_bind_uniform_set(p_cmd_buffer, p_uniform_sets[i], p_shader, p_first_set_index + i, p_dynamic_offsets >> shift, false);
+		const UniformSetInfo *usi = (const UniformSetInfo *)p_uniform_sets[i].id;
+		shift += usi->dynamic_buffers.size() * 4u;
+
+		// At this point this assert should already have been validated.
+		DEV_ASSERT((shift / 4u) <= MAX_DYNAMIC_BUFFERS);
 	}
 }
 
@@ -4755,7 +5286,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indirect_count(CommandBuffe
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw.Get(), p_max_draw_count, indirect_buf_info->resource, p_offset, count_buf_info->resource, p_count_buffer_offset);
 }
 
-void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBufferID p_cmd_buffer, uint32_t p_binding_count, const BufferID *p_buffers, const uint64_t *p_offsets) {
+void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBufferID p_cmd_buffer, uint32_t p_binding_count, const BufferID *p_buffers, const uint64_t *p_offsets, uint64_t p_dynamic_offsets) {
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 
 	DEV_ASSERT(cmd_buf_info->render_pass_state.current_subpass != UINT32_MAX);
@@ -4767,8 +5298,15 @@ void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBuffe
 	for (uint32_t i = 0; i < p_binding_count; i++) {
 		BufferInfo *buffer_info = (BufferInfo *)p_buffers[i].id;
 
+		uint32_t dynamic_offset = 0;
+		if (buffer_info->is_dynamic()) {
+			uint64_t buffer_frame_idx = p_dynamic_offsets & 0x3; // Assuming max 4 frames.
+			p_dynamic_offsets >>= 2;
+			dynamic_offset = buffer_frame_idx * buffer_info->size;
+		}
+
 		cmd_buf_info->render_pass_state.vertex_buffer_views[i] = {};
-		cmd_buf_info->render_pass_state.vertex_buffer_views[i].BufferLocation = buffer_info->resource->GetGPUVirtualAddress() + p_offsets[i];
+		cmd_buf_info->render_pass_state.vertex_buffer_views[i].BufferLocation = buffer_info->resource->GetGPUVirtualAddress() + dynamic_offset + p_offsets[i];
 		cmd_buf_info->render_pass_state.vertex_buffer_views[i].SizeInBytes = buffer_info->size - p_offsets[i];
 		if (!barrier_capabilities.enhanced_barriers_supported) {
 			_resource_transition_batch(cmd_buf_info, buffer_info, 0, 1, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -5154,16 +5692,16 @@ RDD::PipelineID RenderingDeviceDriverD3D12::render_pipeline_create(
 
 	ComPtr<ID3D12Device2> device_2;
 	device->QueryInterface(device_2.GetAddressOf());
-	ID3D12PipelineState *pso = nullptr;
+	ComPtr<ID3D12PipelineState> pso;
 	HRESULT res = E_FAIL;
 	if (device_2) {
 		D3D12_PIPELINE_STATE_STREAM_DESC pssd = {};
 		pssd.pPipelineStateSubobjectStream = &pipeline_desc;
 		pssd.SizeInBytes = sizeof(pipeline_desc);
-		res = device_2->CreatePipelineState(&pssd, IID_PPV_ARGS(&pso));
+		res = device_2->CreatePipelineState(&pssd, IID_PPV_ARGS(pso.GetAddressOf()));
 	} else {
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = pipeline_desc.GraphicsDescV0();
-		res = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		res = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(pso.GetAddressOf()));
 	}
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), PipelineID(), "Create(Graphics)PipelineState failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
@@ -5185,29 +5723,31 @@ void RenderingDeviceDriverD3D12::command_bind_compute_pipeline(CommandBufferID p
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	const PipelineInfo *pipeline_info = (const PipelineInfo *)p_pipeline.id;
 
-	if (cmd_buf_info->compute_pso == pipeline_info->pso) {
+	if (cmd_buf_info->compute_pso == pipeline_info->pso.Get()) {
 		return;
 	}
 
 	const ShaderInfo *shader_info_in = pipeline_info->shader_info;
-	cmd_buf_info->cmd_list->SetPipelineState(pipeline_info->pso);
+	cmd_buf_info->cmd_list->SetPipelineState(pipeline_info->pso.Get());
 	if (cmd_buf_info->compute_root_signature_crc != shader_info_in->root_signature_crc) {
 		cmd_buf_info->cmd_list->SetComputeRootSignature(shader_info_in->root_signature.Get());
 		cmd_buf_info->compute_root_signature_crc = shader_info_in->root_signature_crc;
 	}
 
-	cmd_buf_info->compute_pso = pipeline_info->pso;
+	cmd_buf_info->compute_pso = pipeline_info->pso.Get();
 	cmd_buf_info->graphics_pso = nullptr;
 }
 
-void RenderingDeviceDriverD3D12::command_bind_compute_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
-	_command_bind_uniform_set(p_cmd_buffer, p_uniform_set, p_shader, p_set_index, true);
-}
-
-void RenderingDeviceDriverD3D12::command_bind_compute_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) {
+void RenderingDeviceDriverD3D12::command_bind_compute_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+	uint32_t shift = 0u;
 	for (uint32_t i = 0u; i < p_set_count; ++i) {
 		// TODO: _command_bind_uniform_set() does WAAAAY too much stuff. A lot of it should be already cached in UniformSetID when uniform_set_create() was called. Binding is supposed to be a cheap operation, ideally a memcpy.
-		_command_bind_uniform_set(p_cmd_buffer, p_uniform_sets[i], p_shader, p_first_set_index + i, true);
+		_command_bind_uniform_set(p_cmd_buffer, p_uniform_sets[i], p_shader, p_first_set_index + i, p_dynamic_offsets >> shift, true);
+		const UniformSetInfo *usi = (const UniformSetInfo *)p_uniform_sets[i].id;
+		shift += usi->dynamic_buffers.size() * 4u;
+
+		// At this point this assert should already have been validated.
+		DEV_ASSERT((shift / 4u) <= MAX_DYNAMIC_BUFFERS);
 	}
 }
 
@@ -5253,16 +5793,16 @@ RDD::PipelineID RenderingDeviceDriverD3D12::compute_pipeline_create(ShaderID p_s
 
 	ComPtr<ID3D12Device2> device_2;
 	device->QueryInterface(device_2.GetAddressOf());
-	ID3D12PipelineState *pso = nullptr;
+	ComPtr<ID3D12PipelineState> pso;
 	HRESULT res = E_FAIL;
 	if (device_2) {
 		D3D12_PIPELINE_STATE_STREAM_DESC pssd = {};
 		pssd.pPipelineStateSubobjectStream = &pipeline_desc;
 		pssd.SizeInBytes = sizeof(pipeline_desc);
-		res = device_2->CreatePipelineState(&pssd, IID_PPV_ARGS(&pso));
+		res = device_2->CreatePipelineState(&pssd, IID_PPV_ARGS(pso.GetAddressOf()));
 	} else {
 		D3D12_COMPUTE_PIPELINE_STATE_DESC desc = pipeline_desc.ComputeDescV0();
-		res = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
+		res = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(pso.GetAddressOf()));
 	}
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), PipelineID(), "Create(Compute)PipelineState failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
@@ -5424,17 +5964,11 @@ void RenderingDeviceDriverD3D12::set_object_name(ObjectType p_type, ID p_driver_
 			_set_object_name(shader_info_in->root_signature.Get(), p_name);
 		} break;
 		case OBJECT_TYPE_UNIFORM_SET: {
-			const UniformSetInfo *uniform_set_info = (const UniformSetInfo *)p_driver_id.id;
-			if (uniform_set_info->desc_heaps.resources.get_heap()) {
-				_set_object_name(uniform_set_info->desc_heaps.resources.get_heap(), p_name + " resources heap");
-			}
-			if (uniform_set_info->desc_heaps.samplers.get_heap()) {
-				_set_object_name(uniform_set_info->desc_heaps.samplers.get_heap(), p_name + " samplers heap");
-			}
+			// Descriptor heaps are suballocated from bigger heaps and can therefore not be given unique names.
 		} break;
 		case OBJECT_TYPE_PIPELINE: {
 			const PipelineInfo *pipeline_info = (const PipelineInfo *)p_driver_id.id;
-			_set_object_name(pipeline_info->pso, p_name);
+			_set_object_name(pipeline_info->pso.Get(), p_name);
 		} break;
 		default: {
 			DEV_ASSERT(false);
@@ -5454,14 +5988,18 @@ uint64_t RenderingDeviceDriverD3D12::get_resource_native_handle(DriverResource p
 			return 0;
 		}
 		case DRIVER_RESOURCE_COMMAND_QUEUE: {
-			return (uint64_t)p_driver_id.id;
+			const CommandQueueInfo *cmd_queue_info = (const CommandQueueInfo *)p_driver_id.id;
+			return (uint64_t)cmd_queue_info->d3d_queue.Get();
 		}
 		case DRIVER_RESOURCE_QUEUE_FAMILY: {
 			return 0;
 		}
 		case DRIVER_RESOURCE_TEXTURE: {
 			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;
-			return (uint64_t)tex_info->main_texture;
+			if (tex_info->main_texture) {
+				tex_info = tex_info->main_texture;
+			}
+			return (uint64_t)tex_info->resource;
 		} break;
 		case DRIVER_RESOURCE_TEXTURE_VIEW: {
 			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;
@@ -5573,6 +6111,8 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 			return true;
 		case API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS:
 			return !barrier_capabilities.enhanced_barriers_supported;
+		case API_TRAIT_TEXTURE_OUTPUTS_REQUIRE_CLEARS:
+			return true;
 		default:
 			return RenderingDeviceDriver::api_trait_get(p_trait);
 	}
@@ -5581,7 +6121,7 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 	switch (p_feature) {
 		case SUPPORTS_HALF_FLOAT:
-			return shader_capabilities.native_16bit_ops && storage_buffer_capabilities.storage_buffer_16_bit_access_is_supported;
+			return shader_capabilities.native_16bit_ops;
 		case SUPPORTS_FRAGMENT_SHADER_WITH_ONLY_SIDE_EFFECTS:
 			return true;
 		case SUPPORTS_BUFFER_DEVICE_ADDRESS:
@@ -5811,7 +6351,6 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 	subgroup_capabilities.wave_ops_supported = false;
 	shader_capabilities.shader_model = (D3D_SHADER_MODEL)0;
 	shader_capabilities.native_16bit_ops = false;
-	storage_buffer_capabilities.storage_buffer_16_bit_access_is_supported = false;
 	format_capabilities.relaxed_casting_supported = false;
 
 	{
@@ -5852,9 +6391,8 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
-	if (SUCCEEDED(res)) {
-		storage_buffer_capabilities.storage_buffer_16_bit_access_is_supported = options.TypedUAVLoadAdditionalFormats;
-	}
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_UNAVAILABLE, "CheckFeatureSupport failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_V_MSG(!options.TypedUAVLoadAdditionalFormats, ERR_UNAVAILABLE, "No support for Typed UAV Load Additional Formats has been found.");
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1));
@@ -5994,10 +6532,20 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 	D3D12MA::ALLOCATOR_DESC allocator_desc = {};
 	allocator_desc.pDevice = device.Get();
 	allocator_desc.pAdapter = adapter.Get();
-	allocator_desc.Flags = D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED;
+	allocator_desc.Flags = D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED | D3D12MA::ALLOCATOR_FLAG_DONT_PREFER_SMALL_BUFFERS_COMMITTED;
 
 	HRESULT res = D3D12MA::CreateAllocator(&allocator_desc, &allocator);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::CreateAllocator failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+
+	if (allocator->IsGPUUploadHeapSupported()) {
+		dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_GPU_UPLOAD;
+		print_verbose("D3D12: Device supports GPU UPLOAD heap.");
+	} else {
+		dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_UPLOAD;
+		// Print it as a warning (instead of verbose) because in the rare chance this lesser-used code path
+		// causes bugs, we get an inkling of what's going on (i.e. in order to repro bugs locally).
+		WARN_PRINT("D3D12: Device does NOT support GPU UPLOAD heap. ReBAR must be enabled for this feature. Regular UPLOAD heaps will be used as fallback.");
+	}
 
 	return OK;
 }
@@ -6025,16 +6573,16 @@ Error RenderingDeviceDriverD3D12::_initialize_frames(uint32_t p_frame_count) {
 
 	frames.resize(p_frame_count);
 	for (uint32_t i = 0; i < frames.size(); i++) {
-		err = frames[i].desc_heaps.resources.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, resource_descriptors_per_frame, true);
+		err = frames[i].desc_heaps.resources.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, resource_descriptors_per_frame);
 		ERR_FAIL_COND_V_MSG(err != OK, ERR_CANT_CREATE, "Creating the frame's RESOURCE descriptors heap failed.");
 
-		err = frames[i].desc_heaps.samplers.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_descriptors_per_frame, true);
+		err = frames[i].desc_heaps.samplers.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_descriptors_per_frame);
 		ERR_FAIL_COND_V_MSG(err != OK, ERR_CANT_CREATE, "Creating the frame's SAMPLER descriptors heap failed.");
 
-		err = frames[i].desc_heaps.aux.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, misc_descriptors_per_frame, false);
+		err = frames[i].desc_heaps.aux.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, misc_descriptors_per_frame);
 		ERR_FAIL_COND_V_MSG(err != OK, ERR_CANT_CREATE, "Creating the frame's AUX descriptors heap failed.");
 
-		err = frames[i].desc_heaps.rtv.allocate(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, misc_descriptors_per_frame, false);
+		err = frames[i].desc_heaps.rtv.allocate(this, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, misc_descriptors_per_frame);
 		ERR_FAIL_COND_V_MSG(err != OK, ERR_CANT_CREATE, "Creating the frame's RENDER TARGET descriptors heap failed.");
 
 		frames[i].desc_heap_walkers.resources = frames[i].desc_heaps.resources.make_walker();
@@ -6063,7 +6611,7 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	glsl_type_singleton_init_or_ref();
 
 	context_device = context_driver->device_get(p_device_index);
-	adapter = context_driver->create_adapter(p_device_index);
+	adapter.Attach(context_driver->create_adapter(p_device_index));
 	ERR_FAIL_NULL_V(adapter, ERR_CANT_CREATE);
 
 	HRESULT res = adapter->GetDesc(&adapter_desc);

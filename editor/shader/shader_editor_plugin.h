@@ -39,10 +39,8 @@ class MenuButton;
 class ShaderCreateDialog;
 class ShaderEditor;
 class TabContainer;
-class TextShaderEditor;
 class VBoxContainer;
 class HBoxContainer;
-class VisualShaderEditor;
 class WindowWrapper;
 
 class ShaderEditorPlugin : public EditorPlugin {
@@ -83,13 +81,11 @@ class ShaderEditorPlugin : public EditorPlugin {
 
 	VBoxContainer *main_container = nullptr;
 	HSplitContainer *files_split = nullptr;
-	HBoxContainer *menu_hb = nullptr;
-	Control *menu_spacer = nullptr;
 
 	ItemList *shader_list = nullptr;
 	TabContainer *shader_tabs = nullptr;
+	HBoxContainer *empty_menu = nullptr;
 
-	Button *button = nullptr;
 	MenuButton *file_menu = nullptr;
 	PopupMenu *context_menu = nullptr;
 
@@ -99,6 +95,7 @@ class ShaderEditorPlugin : public EditorPlugin {
 	ShaderCreateDialog *shader_create_dialog = nullptr;
 
 	float text_shader_zoom_factor = 1.0f;
+	bool restoring_layout = false;
 
 	Ref<Resource> _get_current_shader();
 	void _update_shader_list();
@@ -128,7 +125,7 @@ class ShaderEditorPlugin : public EditorPlugin {
 	void _set_text_shader_zoom_factor(float p_zoom_factor);
 	void _update_shader_editor_zoom_factor(CodeTextEditor *p_shader_editor) const;
 
-	void _switch_to_editor(ShaderEditor *p_editor);
+	void _switch_to_editor(ShaderEditor *p_editor, bool p_focus = false);
 
 protected:
 	void _notification(int p_what);
@@ -150,4 +147,5 @@ public:
 	virtual void apply_changes() override;
 
 	ShaderEditorPlugin();
+	~ShaderEditorPlugin();
 };
