@@ -903,9 +903,10 @@ void ClassDB::_add_class(GDType &p_class, const GDType *p_inherits) {
 	if (name == "GDScript") {
 		classes["@GDScript"] = ClassInfo();
 		ClassInfo &ti2 = classes["@GDScript"];
+		ti2.gdtype = &p_class;
 		ti2.api = current_api;
 		if (p_inherits) {
-		  ERR_FAIL_COND(!classes.has(ti2.gdtype->get_super_type_name())); //it MUST be registered.
+			ERR_FAIL_COND(!classes.has(ti2.gdtype->get_super_type_name())); //it MUST be registered.
 			ti2.inherits_ptr = &classes[ti2.gdtype->get_super_type_name()];
 		} else {
 			ti2.inherits_ptr = nullptr;

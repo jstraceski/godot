@@ -2759,6 +2759,10 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("particles_set_draw_passes", "particles", "count"), &RenderingServer::particles_set_draw_passes);
 	ClassDB::bind_method(D_METHOD("particles_set_draw_pass_mesh", "particles", "pass", "mesh"), &RenderingServer::particles_set_draw_pass_mesh);
 	ClassDB::bind_method(D_METHOD("particles_get_current_aabb", "particles"), &RenderingServer::particles_get_current_aabb);
+	ClassDB::bind_method(D_METHOD("particles_get_particle_buffer", "particles"), &RenderingServer::particles_get_particle_buffer);
+	ClassDB::bind_method(D_METHOD("particles_get_instance_buffer", "particles"), &RenderingServer::particles_get_instance_buffer);
+	ClassDB::bind_method(D_METHOD("particles_get_read_buffer", "particles"), &RenderingServer::particles_get_read_buffer);
+	ClassDB::bind_method(D_METHOD("particles_get_external_boid_buffer", "particles"), &RenderingServer::particles_get_external_boid_buffer);
 	ClassDB::bind_method(D_METHOD("particles_set_emission_transform", "particles", "transform"), &RenderingServer::particles_set_emission_transform);
 
 	BIND_ENUM_CONSTANT(RSE::PARTICLES_MODE_2D);
@@ -3584,6 +3588,7 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::SPLASH_STRETCH_MODE_IGNORE);
 
 	ADD_SIGNAL(MethodInfo("frame_pre_draw"));
+	ADD_SIGNAL(MethodInfo("frame_draw_begin"));
 	ADD_SIGNAL(MethodInfo("frame_post_draw"));
 
 	ClassDB::bind_method(D_METHOD("force_sync"), &RenderingServer::sync);

@@ -89,6 +89,7 @@ ParticlesStorage::ParticlesStorage() {
 		actions.renames["DELTA"] = "local_delta";
 		actions.renames["NUMBER"] = "particle_number";
 		actions.renames["INDEX"] = "index";
+		actions.renames["COUNT"] = "params.total_particles";
 		//actions.renames["GRAVITY"] = "current_gravity";
 		actions.renames["EMISSION_TRANSFORM"] = "FRAME.emission_transform";
 		actions.renames["EMITTER_VELOCITY"] = "FRAME.emitter_velocity";
@@ -105,6 +106,11 @@ ParticlesStorage::ParticlesStorage() {
 		actions.renames["RESTART_COLOR"] = "restart_color";
 		actions.renames["RESTART_CUSTOM"] = "restart_custom";
 		actions.renames["emit_subparticle"] = "emit_subparticle";
+		actions.renames["boid_position"] = "boid_position";
+		actions.renames["boid_velocity"] = "boid_velocity";
+		actions.renames["boid_ext_position"] = "boid_ext_position";
+		actions.renames["boid_ext_velocity"] = "boid_ext_velocity";
+		actions.renames["boid_ext_rotation"] = "boid_ext_rotation";
 		actions.renames["COLLIDED"] = "collided";
 		actions.renames["COLLISION_NORMAL"] = "collision_normal";
 		actions.renames["COLLISION_DEPTH"] = "collision_depth";
@@ -274,9 +280,30 @@ void ParticlesStorage::_particles_free_data(Particles *particles) {
 	if (particles->particle_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(particles->particle_buffer);
 		particles->particle_buffer = RID();
+		RD::get_singleton()->free_rid(particles->particle_buffer_b);
+		particles->particle_buffer_b = RID();
+		if (particles->external_boid_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(particles->external_boid_buffer);
+			particles->external_boid_buffer = RID();
+		}
+		if (particles->unused_external_boid_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(particles->unused_external_boid_buffer);
+			particles->unused_external_boid_buffer = RID();
+		}
+		particles->ping = false;
 		RD::get_singleton()->free_rid(particles->particle_instance_buffer);
 		particles->particle_instance_buffer = RID();
 	}
+
+	if (RD::get_singleton()->uniform_set_is_valid(particles->particles_material_uniform_set_b)) {
+		RD::get_singleton()->free_rid(particles->particles_material_uniform_set_b);
+	}
+	particles->particles_material_uniform_set_b = RID();
+
+	if (RD::get_singleton()->uniform_set_is_valid(particles->particles_copy_uniform_set_b)) {
+		RD::get_singleton()->free_rid(particles->particles_copy_uniform_set_b);
+	}
+	particles->particles_copy_uniform_set_b = RID();
 
 	particles->userdata_count = 0;
 
@@ -588,6 +615,66 @@ void ParticlesStorage::_particles_ensure_unused_trail_buffer(Particles *particle
 	}
 }
 
+void ParticlesStorage::_particles_ensure_unused_external_boid_buffer(Particles *particles) {
+	if (particles->unused_external_boid_buffer.is_null()) {
+		// Small placeholder buffer for binding 5 when no external boid buffer is set.
+		// Never read by the shader in that case (boid_ext_* accessors are only used
+		// when an external buffer is configured).
+		particles->unused_external_boid_buffer = RD::get_singleton()->storage_buffer_create(64);
+	}
+}
+
+void ParticlesStorage::particles_set_external_boid_buffer(RID p_particles, RID p_buffer) {
+	Particles *particles = particles_owner.get_or_null(p_particles);
+	if (!particles) {
+		return;
+	}
+	particles->external_boid_buffer = p_buffer;
+	// Invalidate cached uniform sets so the new binding is picked up next frame.
+	if (particles->particles_material_uniform_set.is_valid()) {
+		RD::get_singleton()->free_rid(particles->particles_material_uniform_set);
+		particles->particles_material_uniform_set = RID();
+	}
+	if (particles->particles_material_uniform_set_b.is_valid()) {
+		RD::get_singleton()->free_rid(particles->particles_material_uniform_set_b);
+		particles->particles_material_uniform_set_b = RID();
+	}
+}
+
+RID ParticlesStorage::particles_get_external_boid_buffer(RID p_particles) const {
+	Particles *particles = particles_owner.get_or_null(p_particles);
+	if (!particles) {
+		return RID();
+	}
+	return particles->external_boid_buffer;
+}
+
+RID ParticlesStorage::particles_get_particle_buffer(RID p_particles) const {
+	Particles *particles = particles_owner.get_or_null(p_particles);
+	if (!particles) {
+		return RID();
+	}
+	// Ping-pong: the latest state is in the write buffer.
+	return particles->ping ? particles->particle_buffer : particles->particle_buffer_b;
+}
+
+RID ParticlesStorage::particles_get_instance_buffer(RID p_particles) const {
+	Particles *particles = particles_owner.get_or_null(p_particles);
+	if (!particles) {
+		return RID();
+	}
+	return particles->particle_instance_buffer;
+}
+
+RID ParticlesStorage::particles_get_read_buffer(RID p_particles) const {
+	Particles *particles = particles_owner.get_or_null(p_particles);
+	if (!particles) {
+		return RID();
+	}
+	// Ping-pong: the read buffer holds the previous frame's state.
+	return particles->ping ? particles->particle_buffer_b : particles->particle_buffer;
+}
+
 void ParticlesStorage::particles_set_subemitter(RID p_particles, RID p_subemitter_particles) {
 	Particles *particles = particles_owner.get_or_null(p_particles);
 	ERR_FAIL_NULL(particles);
@@ -664,8 +751,11 @@ AABB ParticlesStorage::particles_get_current_aabb(RID p_particles) {
 	}
 
 	uint32_t particle_data_size = sizeof(ParticleData) + sizeof(float) * 4 * particles->userdata_count;
-	Vector<uint8_t> buffer = RD::get_singleton()->buffer_get_data(particles->particle_buffer);
-	ERR_FAIL_COND_V(buffer.size() != (int)(total_amount * particle_data_size), AABB());
+	Vector<uint8_t> buffer = RD::get_singleton()->buffer_get_data(particles->ping ? particles->particle_buffer_b : particles->particle_buffer);
+	if (buffer.size() != (int)(total_amount * particle_data_size)) {
+		// Buffer size may differ due to std430 alignment; use actual size.
+		total_amount = buffer.size() / (int)particle_data_size;
+	}
 
 	Transform3D inv = particles->emission_transform.affine_inverse();
 
@@ -678,6 +768,8 @@ AABB ParticlesStorage::particles_get_current_aabb(RID p_particles) {
 		for (int i = 0; i < total_amount; i++) {
 			const ParticleData &particle_data = *(const ParticleData *)&data_ptr[particle_data_size * i];
 			if (particle_data.active) {
+				if (i == 0) {
+				}
 				Vector3 pos = Vector3(particle_data.xform[12], particle_data.xform[13], particle_data.xform[14]);
 				if (!particles->use_local_coords) {
 					pos = inv.xform(pos);
@@ -786,7 +878,13 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 	TextureStorage *texture_storage = TextureStorage::get_singleton();
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
 
-	if (p_particles->particles_material_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(p_particles->particles_material_uniform_set)) {
+	// Ping-pong: the process pass reads the previous frame's state from one buffer and
+	// writes the new state to the other. `ping` selects which cached uniform set to use.
+	RID &particles_material_uniform_set = p_particles->ping ? p_particles->particles_material_uniform_set_b : p_particles->particles_material_uniform_set;
+	RID &write_buffer = p_particles->ping ? p_particles->particle_buffer : p_particles->particle_buffer_b;
+	RID &read_buffer = p_particles->ping ? p_particles->particle_buffer_b : p_particles->particle_buffer;
+
+	if (particles_material_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(particles_material_uniform_set)) {
 		thread_local LocalVector<RD::Uniform> uniforms;
 		uniforms.clear();
 
@@ -801,7 +899,7 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.binding = 1;
-			u.append_id(p_particles->particle_buffer);
+			u.append_id(write_buffer);
 			uniforms.push_back(u);
 		}
 
@@ -833,8 +931,27 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 			}
 			uniforms.push_back(u);
 		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 4;
+			u.append_id(read_buffer);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 5;
+			if (p_particles->external_boid_buffer.is_valid()) {
+				u.append_id(p_particles->external_boid_buffer);
+			} else {
+				_particles_ensure_unused_external_boid_buffer(p_particles);
+				u.append_id(p_particles->unused_external_boid_buffer);
+			}
+			uniforms.push_back(u);
+		}
 
-		p_particles->particles_material_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, particles_shader.default_shader_rd, 1);
+		particles_material_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, particles_shader.default_shader_rd, 1);
 	}
 
 	double new_phase = Math::fmod((double)(p_particles->phase + (p_delta / p_particles->lifetime)), 1.0);
@@ -1207,7 +1324,7 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, m->shader_data->pipeline.get_rid());
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles_shader.base_uniform_set, BASE_UNIFORM_SET);
-	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, p_particles->particles_material_uniform_set, MATERIAL_UNIFORM_SET);
+	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles_material_uniform_set, MATERIAL_UNIFORM_SET);
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, p_particles->collision_textures_uniform_set, COLLISION_TEXTURTES_UNIFORM_SET);
 
 	if (m->uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(m->uniform_set)) {
@@ -1231,6 +1348,10 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 	}
 
 	RD::get_singleton()->compute_list_end();
+
+
+	// Ping-pong: the buffer just written to now holds the current state.
+	p_particles->ping = !p_particles->ping;
 }
 
 void ParticlesStorage::particles_set_view_axis(RID p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis) {
@@ -1320,7 +1441,7 @@ void ParticlesStorage::particles_set_view_axis(RID p_particles, const Vector3 &p
 		RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
 		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, particles_shader.copy_pipelines[particles->userdata_count][ParticlesShader::COPY_MODE_FILL_SORT_BUFFER].get_rid());
-		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->particles_copy_uniform_set, 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->ping ? particles->particles_copy_uniform_set_b : particles->particles_copy_uniform_set, 0);
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->particles_sort_uniform_set, 1);
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->trail_bind_pose_uniform_set, 2);
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &copy_push_constant, sizeof(ParticlesShader::CopyPushConstant));
@@ -1339,7 +1460,7 @@ void ParticlesStorage::particles_set_view_axis(RID p_particles, const Vector3 &p
 	uint32_t copy_mode = do_sort ? ParticlesShader::COPY_MODE_FILL_INSTANCES_WITH_SORT_BUFFER : ParticlesShader::COPY_MODE_FILL_INSTANCES;
 	copy_push_constant.copy_mode_2d = particles->mode == RSE::PARTICLES_MODE_2D ? 1 : 0;
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, particles_shader.copy_pipelines[particles->userdata_count][copy_mode].get_rid());
-	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->particles_copy_uniform_set, 0);
+	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->ping ? particles->particles_copy_uniform_set_b : particles->particles_copy_uniform_set, 0);
 	if (do_sort) {
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, particles->particles_sort_uniform_set, 1);
 	}
@@ -1392,7 +1513,11 @@ void ParticlesStorage::_particles_update_buffers(Particles *particles) {
 
 		uint32_t xform_size = particles->mode == RSE::PARTICLES_MODE_2D ? 2 : 3;
 		if (particles->particle_buffer.is_null()) {
-			particles->particle_buffer = RD::get_singleton()->storage_buffer_create((sizeof(ParticleData) + userdata_count * sizeof(float) * 4) * total_amount);
+			uint32_t particle_buffer_size = (sizeof(ParticleData) + userdata_count * sizeof(float) * 4) * total_amount;
+			particles->particle_buffer = RD::get_singleton()->storage_buffer_create(particle_buffer_size);
+			// Ping-pong partner buffer: holds the previous frame's state (read snapshot).
+			particles->particle_buffer_b = RD::get_singleton()->storage_buffer_create(particle_buffer_size);
+			particles->ping = false;
 			particles->userdata_count = userdata_count;
 			particles->restart_request = true;
 		}
@@ -1427,6 +1552,24 @@ void ParticlesStorage::_particles_update_buffers(Particles *particles) {
 			}
 
 			particles->particles_copy_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, particles_shader.copy_shader.version_get_shader(particles_shader.copy_shader_version, 0), 0);
+
+			// Ping-pong partner copy set: reads the other buffer (current state when ping == true).
+			Vector<RD::Uniform> uniforms_b;
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+				u.binding = 1;
+				u.append_id(particles->particle_buffer_b);
+				uniforms_b.push_back(u);
+			}
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+				u.binding = 2;
+				u.append_id(particles->particle_instance_buffer);
+				uniforms_b.push_back(u);
+			}
+			particles->particles_copy_uniform_set_b = RD::get_singleton()->uniform_set_create(uniforms_b, particles_shader.copy_shader.version_get_shader(particles_shader.copy_shader_version, 0), 0);
 		}
 
 		particles->instance_motion_vectors_current_offset = 0;

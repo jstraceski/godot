@@ -329,6 +329,11 @@ public:
 	virtual void particles_set_emitting(RID p_particles, bool p_emitting) override;
 	virtual void particles_set_amount(RID p_particles, int p_amount) override;
 	virtual void particles_set_amount_ratio(RID p_particles, float p_amount_ratio) override;
+	virtual void particles_set_external_boid_buffer(RID p_particles, RID p_buffer) override;
+	virtual RID particles_get_external_boid_buffer(RID p_particles) const override;
+	virtual RID particles_get_particle_buffer(RID p_particles) const override;
+	virtual RID particles_get_instance_buffer(RID p_particles) const override;
+	virtual RID particles_get_read_buffer(RID p_particles) const override;
 	virtual void particles_set_lifetime(RID p_particles, double p_lifetime) override;
 	virtual void particles_set_one_shot(RID p_particles, bool p_one_shot) override;
 	virtual void particles_set_pre_process_time(RID p_particles, double p_time) override;

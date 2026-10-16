@@ -76,6 +76,9 @@ void RenderingServerDefault::request_frame_drawn_callback(const Callable &p_call
 void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
+	// Emit after begin_frame (which resets the draw graph) so user code can
+	// record compute/draw lists into the frame's recording window.
+	RS::get_singleton()->emit_signal(SNAME("frame_draw_begin"));
 
 	TIMESTAMP_BEGIN()
 

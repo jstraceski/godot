@@ -59,6 +59,11 @@ public:
 
 	virtual void particles_set_amount(RID p_particles, int p_amount) = 0;
 	virtual void particles_set_amount_ratio(RID p_particles, float p_amount_ratio) = 0;
+	virtual void particles_set_external_boid_buffer(RID p_particles, RID p_buffer) = 0;
+	virtual RID particles_get_external_boid_buffer(RID p_particles) const = 0;
+	virtual RID particles_get_particle_buffer(RID p_particles) const = 0;
+	virtual RID particles_get_instance_buffer(RID p_particles) const = 0;
+	virtual RID particles_get_read_buffer(RID p_particles) const = 0;
 	virtual void particles_set_lifetime(RID p_particles, double p_lifetime) = 0;
 	virtual void particles_set_one_shot(RID p_particles, bool p_one_shot) = 0;
 	virtual void particles_set_pre_process_time(RID p_particles, double p_time) = 0;

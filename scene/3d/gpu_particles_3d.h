@@ -203,6 +203,11 @@ public:
 	uint32_t get_seed() const;
 	void request_particles_process(real_t p_requested_process_time, real_t p_request_process_time_residual = 0.0f);
 
+	RID get_rid() const;
+
+	void set_external_boid_buffer(const RID &p_buffer);
+	RID get_external_boid_buffer() const;
+
 	enum EmitFlags {
 		EMIT_FLAG_POSITION = RSE::PARTICLES_EMIT_FLAG_POSITION,
 		EMIT_FLAG_ROTATION_SCALE = RSE::PARTICLES_EMIT_FLAG_ROTATION_SCALE,

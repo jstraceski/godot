@@ -126,6 +126,18 @@ uint32_t GPUParticles3D::get_seed() const {
 	return seed;
 }
 
+RID GPUParticles3D::get_rid() const {
+	return particles;
+}
+
+void GPUParticles3D::set_external_boid_buffer(const RID &p_buffer) {
+	RS::get_singleton()->particles_set_external_boid_buffer(particles, p_buffer);
+}
+
+RID GPUParticles3D::get_external_boid_buffer() const {
+	return RS::get_singleton()->particles_get_external_boid_buffer(particles);
+}
+
 void GPUParticles3D::set_pre_process_time(double p_time) {
 	pre_process_time = p_time;
 	RS::get_singleton()->particles_set_pre_process_time(particles, pre_process_time);
@@ -825,6 +837,11 @@ void GPUParticles3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_draw_order"), &GPUParticles3D::get_draw_order);
 
+	ClassDB::bind_method(D_METHOD("get_rid"), &GPUParticles3D::get_rid);
+
+	ClassDB::bind_method(D_METHOD("set_external_boid_buffer", "buffer"), &GPUParticles3D::set_external_boid_buffer);
+	ClassDB::bind_method(D_METHOD("get_external_boid_buffer"), &GPUParticles3D::get_external_boid_buffer);
+
 	ClassDB::bind_method(D_METHOD("set_draw_passes", "passes"), &GPUParticles3D::set_draw_passes);
 	ClassDB::bind_method(D_METHOD("set_draw_pass_mesh", "pass", "mesh"), &GPUParticles3D::set_draw_pass_mesh);
 
@@ -869,6 +886,7 @@ void GPUParticles3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "emitting", PROPERTY_HINT_ONESHOT), "set_emitting", "is_emitting");
 	ADD_PROPERTY_DEFAULT("emitting", true); // Workaround for doctool in headless mode, as dummy rasterizer always returns false.
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "amount", PROPERTY_HINT_RANGE, "1,1000000,1,exp"), "set_amount", "get_amount"); // FIXME: Evaluate support for `exp` in integer properties, or remove this.
+	ADD_PROPERTY(PropertyInfo(Variant::RID, "external_boid_buffer"), "set_external_boid_buffer", "get_external_boid_buffer");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "amount_ratio", PROPERTY_HINT_RANGE, "0,1,0.0001"), "set_amount_ratio", "get_amount_ratio");
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "sub_emitter", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "GPUParticles3D"), "set_sub_emitter", "get_sub_emitter");
 	ADD_GROUP("Time", "");

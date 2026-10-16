@@ -402,6 +402,7 @@ ShaderTypes::ShaderTypes() {
 	shader_modes[RSE::SHADER_PARTICLES].functions["start"].built_ins["RESTART_COLOR"] = constt(ShaderLanguage::TYPE_BOOL);
 	shader_modes[RSE::SHADER_PARTICLES].functions["start"].built_ins["RESTART_CUSTOM"] = constt(ShaderLanguage::TYPE_BOOL);
 	shader_modes[RSE::SHADER_PARTICLES].functions["start"].built_ins["AMOUNT_RATIO"] = constt(ShaderLanguage::TYPE_FLOAT);
+	shader_modes[RSE::SHADER_PARTICLES].functions["start"].built_ins["COUNT"] = constt(ShaderLanguage::TYPE_UINT);
 	shader_modes[RSE::SHADER_PARTICLES].functions["start"].main_function = true;
 
 	shader_modes[RSE::SHADER_PARTICLES].functions["process"].built_ins["COLOR"] = ShaderLanguage::TYPE_VEC4;
@@ -435,6 +436,7 @@ ShaderTypes::ShaderTypes() {
 	shader_modes[RSE::SHADER_PARTICLES].functions["process"].built_ins["COLLISION_DEPTH"] = constt(ShaderLanguage::TYPE_FLOAT);
 	shader_modes[RSE::SHADER_PARTICLES].functions["process"].built_ins["ATTRACTOR_FORCE"] = constt(ShaderLanguage::TYPE_VEC3);
 	shader_modes[RSE::SHADER_PARTICLES].functions["process"].built_ins["AMOUNT_RATIO"] = constt(ShaderLanguage::TYPE_FLOAT);
+	shader_modes[RSE::SHADER_PARTICLES].functions["process"].built_ins["COUNT"] = constt(ShaderLanguage::TYPE_UINT);
 	shader_modes[RSE::SHADER_PARTICLES].functions["process"].main_function = true;
 
 	{
@@ -447,6 +449,41 @@ ShaderTypes::ShaderTypes() {
 		emit_vertex_func.return_type = ShaderLanguage::TYPE_BOOL; //whether it could emit
 		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["emit_subparticle"] = emit_vertex_func;
 		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["emit_subparticle"] = emit_vertex_func;
+	}
+
+	// Cross-particle state accessors (boids / CPU-less flocking): read other
+	// particles' state from the ping-pong read buffer (previous frame's snapshot).
+	{
+		ShaderLanguage::StageFunctionInfo boid_position_func;
+		boid_position_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("index", ShaderLanguage::TYPE_INT));
+		boid_position_func.return_type = ShaderLanguage::TYPE_VEC3;
+		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["boid_position"] = boid_position_func;
+		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["boid_position"] = boid_position_func;
+
+		ShaderLanguage::StageFunctionInfo boid_velocity_func;
+		boid_velocity_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("index", ShaderLanguage::TYPE_INT));
+		boid_velocity_func.return_type = ShaderLanguage::TYPE_VEC3;
+		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["boid_velocity"] = boid_velocity_func;
+		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["boid_velocity"] = boid_velocity_func;
+
+		// External boid accessors: read a separate compute's output buffer (binding 5).
+		ShaderLanguage::StageFunctionInfo boid_ext_position_func;
+		boid_ext_position_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("index", ShaderLanguage::TYPE_INT));
+		boid_ext_position_func.return_type = ShaderLanguage::TYPE_VEC3;
+		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["boid_ext_position"] = boid_ext_position_func;
+		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["boid_ext_position"] = boid_ext_position_func;
+
+		ShaderLanguage::StageFunctionInfo boid_ext_velocity_func;
+		boid_ext_velocity_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("index", ShaderLanguage::TYPE_INT));
+		boid_ext_velocity_func.return_type = ShaderLanguage::TYPE_VEC3;
+		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["boid_ext_velocity"] = boid_ext_velocity_func;
+		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["boid_ext_velocity"] = boid_ext_velocity_func;
+
+		ShaderLanguage::StageFunctionInfo boid_ext_rotation_func;
+		boid_ext_rotation_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("index", ShaderLanguage::TYPE_INT));
+		boid_ext_rotation_func.return_type = ShaderLanguage::TYPE_VEC4;
+		shader_modes[RSE::SHADER_PARTICLES].functions["start"].stage_functions["boid_ext_rotation"] = boid_ext_rotation_func;
+		shader_modes[RSE::SHADER_PARTICLES].functions["process"].stage_functions["boid_ext_rotation"] = boid_ext_rotation_func;
 	}
 
 	// particles render modes

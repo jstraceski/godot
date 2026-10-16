@@ -198,13 +198,19 @@ private:
 		RID trail_bind_pose_uniform_set;
 
 		RID particle_buffer;
+		RID particle_buffer_b; //ping-pong partner: holds the previous frame's state (read snapshot)
+		RID external_boid_buffer; // external compute's output buffer (set 1 binding 5); RID() when unused
+		RID unused_external_boid_buffer; // placeholder buffer for binding 5 when no external buffer is set
+		bool ping = false; //false: current state in particle_buffer, true: in particle_buffer_b
 		RID particle_instance_buffer;
 		RID frame_params_buffer;
 
 		uint32_t userdata_count = 0;
 
 		RID particles_material_uniform_set;
+		RID particles_material_uniform_set_b; //ping-pong partner (current state in particle_buffer_b)
 		RID particles_copy_uniform_set;
+		RID particles_copy_uniform_set_b; //ping-pong partner (current state in particle_buffer_b)
 		RID particles_transforms_buffer_uniform_set;
 		RID collision_textures_uniform_set;
 
@@ -276,6 +282,7 @@ private:
 	void _particles_allocate_emission_buffer(Particles *particles);
 	void _particles_ensure_unused_emission_buffer(Particles *particles);
 	void _particles_ensure_unused_trail_buffer(Particles *particles);
+	void _particles_ensure_unused_external_boid_buffer(Particles *particles);
 	void _particles_free_data(Particles *particles);
 	void _particles_update_buffers(Particles *particles);
 
@@ -453,6 +460,11 @@ public:
 	virtual void particles_set_emitting(RID p_particles, bool p_emitting) override;
 	virtual void particles_set_amount(RID p_particles, int p_amount) override;
 	virtual void particles_set_amount_ratio(RID p_particles, float p_amount_ratio) override;
+	virtual void particles_set_external_boid_buffer(RID p_particles, RID p_buffer) override;
+	virtual RID particles_get_external_boid_buffer(RID p_particles) const override;
+	virtual RID particles_get_particle_buffer(RID p_particles) const override;
+	virtual RID particles_get_instance_buffer(RID p_particles) const override;
+	virtual RID particles_get_read_buffer(RID p_particles) const override;
 	virtual void particles_set_lifetime(RID p_particles, double p_lifetime) override;
 	virtual void particles_set_one_shot(RID p_particles, bool p_one_shot) override;
 	virtual void particles_set_pre_process_time(RID p_particles, double p_time) override;

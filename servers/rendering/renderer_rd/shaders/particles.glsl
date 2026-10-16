@@ -126,6 +126,27 @@ layout(set = 1, binding = 1, std430) restrict buffer Particles {
 }
 particles;
 
+// Ping-pong read buffer: snapshot of the previous frame's state.
+// The process pass copies it into `particles` at the start of each dispatch,
+// so all reads/writes in this shader operate on a consistent snapshot while
+// other invocations write new state. This is what makes cross-particle
+// reads (boids) well-defined.
+layout(set = 1, binding = 4, std430) restrict readonly buffer ParticlesPrev {
+	ParticleData data[];
+}
+particles_prev;
+
+// External boid output buffer: written by a separate compute shader (fixed, no
+// ping-pong). Bound when a GPUParticles3D is configured with an external boid
+// buffer. Points to a small placeholder when not set.
+// Single contiguous array of N*3 vec4: pos[0..N-1], vel[0..N-1], rot[0..N-1].
+// (A single runtime-sized array is what the shader compiler accepts; multiple
+// runtime-sized arrays in one buffer are not.)
+layout(set = 1, binding = 5, std430) restrict readonly buffer BoidOutput {
+	vec4 data[];
+}
+boid_output;
+
 #define EMISSION_FLAG_HAS_POSITION 1
 #define EMISSION_FLAG_HAS_ROTATION_SCALE 2
 #define EMISSION_FLAG_HAS_VELOCITY 4
@@ -225,6 +246,45 @@ vec3 safe_normalize(vec3 direction) {
 	return normalize(direction);
 }
 
+// --- Cross-particle state accessors (boids / CPU-less flocking) ---
+// Callable from a user process() body to read *other* particles' state
+// directly from the ping-pong read buffer (previous frame's snapshot).
+// This is what enables CPU-less flocking: each particle reads its neighbors
+// on the GPU, with no CPU round-trip. Assumes no trails (trail_size == 1),
+// which is the boids case.
+ParticleData boid_state(int index) {
+	index = clamp(index, 0, int(params.total_particles) - 1);
+	return particles_prev.data[index];
+}
+
+vec3 boid_position(int index) {
+	return particles_prev.data[clamp(index, 0, int(params.total_particles) - 1)].xform[3].xyz;
+}
+
+vec3 boid_velocity(int index) {
+	return particles_prev.data[clamp(index, 0, int(params.total_particles) - 1)].velocity;
+}
+
+// External boid accessors: read the separate compute's output buffer (binding 5).
+// Layout: data[0..N-1] = pos, data[N..2N-1] = vel, data[2N..3N-1] = rot.
+vec3 boid_ext_position(int index) {
+	int n = int(params.total_particles);
+	int i = clamp(index, 0, n - 1);
+	return boid_output.data[i].xyz;
+}
+
+vec3 boid_ext_velocity(int index) {
+	int n = int(params.total_particles);
+	int i = clamp(index, 0, n - 1);
+	return boid_output.data[n + i].xyz;
+}
+
+vec4 boid_ext_rotation(int index) {
+	int n = int(params.total_particles);
+	int i = clamp(index, 0, n - 1);
+	return boid_output.data[2 * n + i];
+}
+
 #GLOBALS
 
 void main() {
@@ -253,6 +313,18 @@ void main() {
 
 #define FRAME frame_history.data[frame]
 #define PARTICLE particles.data[particle]
+#define PARTICLE_PREV particles_prev.data[particle]
+
+// Ping-pong: snapshot the previous frame's state into the write buffer so
+// that all subsequent reads/writes operate on a consistent copy.
+{
+	ParticleData tmp = PARTICLE_PREV;
+	PARTICLE.xform = tmp.xform;
+	PARTICLE.velocity = tmp.velocity;
+	PARTICLE.flags = tmp.flags;
+	PARTICLE.color = tmp.color;
+	PARTICLE.custom = tmp.custom;
+}
 
 	bool apply_forces = true;
 	bool apply_velocity = true;

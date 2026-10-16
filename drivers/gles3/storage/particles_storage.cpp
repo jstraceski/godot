@@ -205,6 +205,26 @@ void ParticlesStorage::particles_set_amount_ratio(RID p_particles, float p_amoun
 	particles->amount_ratio = p_amount_ratio;
 }
 
+void ParticlesStorage::particles_set_external_boid_buffer(RID p_particles, RID p_buffer) {
+	// Not supported in the GLES3 backend; no-op.
+}
+
+RID ParticlesStorage::particles_get_external_boid_buffer(RID p_particles) const {
+	return RID();
+}
+
+RID ParticlesStorage::particles_get_particle_buffer(RID p_particles) const {
+	return RID();
+}
+
+RID ParticlesStorage::particles_get_instance_buffer(RID p_particles) const {
+	return RID();
+}
+
+RID ParticlesStorage::particles_get_read_buffer(RID p_particles) const {
+	return RID();
+}
+
 void ParticlesStorage::particles_set_lifetime(RID p_particles, double p_lifetime) {
 	Particles *particles = particles_owner.get_or_null(p_particles);
 	ERR_FAIL_NULL(particles);
