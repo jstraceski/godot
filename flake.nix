@@ -12,9 +12,6 @@
       system = "x86_64-linux";
       pkgs = inputs.nixpkgs.legacyPackages.${system};
       g = pkgs.godot;
-      # Your system's NVIDIA Vulkan ICD (from the installed nvidia-x11 driver).
-      # If you update the driver, update this path.
-      nvidiaIcd = "/nix/store/rsha0mmmyzsrbryja5ck9w0cdcsj1lap-nvidia-x11-595.71.05/share/vulkan/icd.d/nvidia_icd.json";
     in
     {
       # `cd ~/godot && nix develop` enters this shell.
@@ -44,7 +41,8 @@
           echo "Build debug editor:  scons debug=1   (or: build-godot)"
           echo "Binary:  bin/godot.linuxbsd.editor.dev.x86_64"
           # Runtime display / Vulkan libs the engine dlopens at startup.
-          export VK_DRIVER_FILES="${nvidiaIcd}"
+          # Find the system-installed NVIDIA Vulkan ICD (store hash differs per machine).
+          export VK_DRIVER_FILES="$(find /nix/store -maxdepth 6 -name nvidia_icd.json -path '*nvidia-x11*' -not -path '*lib32*' 2>/dev/null | head -1)"
           export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${pkgs.vulkan-loader}/lib:${pkgs.libX11}/lib:${pkgs.libXcursor}/lib:${pkgs.libXext}/lib:${pkgs.libXi}/lib:${pkgs.libXrender}/lib:${pkgs.libXrandr}/lib:${pkgs.libXinerama}/lib:${pkgs.libXfixes}/lib:${pkgs.libXScrnSaver}/lib:${pkgs.libXpresent}/lib:${pkgs.libXcomposite}/lib:${pkgs.libXdamage}/lib:${pkgs.libxkbcommon}/lib:${pkgs.fontconfig.lib}/lib:${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:${pkgs.alsa-lib}/lib:${pkgs.libpulseaudio}/lib"
         '';
       };
